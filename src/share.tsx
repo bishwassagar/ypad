@@ -80,6 +80,17 @@ export function ShareModal({ open, onClose }: ShareModalProps) {
             {copied ? "Copied" : "Copy"}
           </button>
         </div>
+        <p className="mt-4 border-t border-neutral-200 pt-3 text-center text-xs text-neutral-400 dark:border-neutral-800 dark:text-neutral-500">
+          crafted with ☕ &amp; CRDTs by{" "}
+          <a
+            href="https://github.com/bishwassagar/ypad"
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100"
+          >
+            Bishwas Sagar
+          </a>
+        </p>
       </div>
     </div>
   );

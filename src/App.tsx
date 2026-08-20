@@ -161,8 +161,11 @@ export default function App() {
       <header className="flex h-12 shrink-0 items-center gap-3 border-b border-neutral-200 px-3 dark:border-neutral-800 sm:px-4">
         <div className="flex items-center gap-2">
           <span className="text-base font-bold tracking-tight">YPad</span>
-          <span className="hidden rounded-md bg-neutral-100 px-2 py-0.5 text-xs font-medium text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300 sm:inline">
-            #{roomId.slice(0, 6)}
+          <span
+            title={`Room ${roomId}`}
+            className="hidden max-w-28 truncate rounded-md bg-neutral-100 px-2 py-0.5 text-xs font-medium text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300 sm:inline"
+          >
+            #{roomId}
           </span>
         </div>
 
