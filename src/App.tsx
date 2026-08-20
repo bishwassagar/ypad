@@ -24,6 +24,7 @@ import { ToolbarButton } from "./ui/ToolbarButton";
 
 const SYNC_HOST = import.meta.env.VITE_SYNC_HOST ?? "localhost:8787";
 const WS_CONNECT_TIMEOUT_MS = 5000;
+const WS_SYNC_TIMEOUT_MS = 10000;
 
 function syncServerUrl(): string {
   const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/.test(SYNC_HOST);
@@ -53,6 +54,7 @@ function roomIdFromHash(): string {
 
 interface SyncProviderLike {
   off(name: "status", f: (e: { status: string }) => void): unknown;
+  off(name: "sync", f: (synced: boolean) => void): unknown;
   disconnect(): void;
   destroy(): void;
 }
@@ -79,7 +81,9 @@ export default function App() {
   useEffect(() => {
     let current: WebsocketProvider | HttpSyncProvider | null = null;
     let wsEverConnected = false;
+    let wsSynced = false;
     let connectTimeout: number | undefined;
+    let syncTimeout: number | undefined;
     let cancelled = false;
 
     function setStatusFrom(e: { status: string }) {
@@ -94,20 +98,34 @@ export default function App() {
 
     function teardown(
       p: SyncProviderLike,
-      handler: (e: { status: string }) => void
+      statusHandler: (e: { status: string }) => void,
+      syncHandler: (synced: boolean) => void
     ) {
-      p.off("status", handler);
+      p.off("status", statusHandler);
+      p.off("sync", syncHandler);
       p.disconnect();
       p.destroy();
     }
 
-    function switchToHttp() {
-      if (cancelled || current instanceof HttpSyncProvider) return;
+    function clearConnectTimeout() {
       if (connectTimeout !== undefined) {
         clearTimeout(connectTimeout);
         connectTimeout = undefined;
       }
-      if (current) teardown(current, onWsStatus);
+    }
+
+    function clearSyncTimeout() {
+      if (syncTimeout !== undefined) {
+        clearTimeout(syncTimeout);
+        syncTimeout = undefined;
+      }
+    }
+
+    function switchToHttp() {
+      if (cancelled || current instanceof HttpSyncProvider) return;
+      clearConnectTimeout();
+      clearSyncTimeout();
+      if (current) teardown(current, onWsStatus, onWsSync);
       const p = new HttpSyncProvider(httpSyncServerUrl(), roomId, doc, {
         awareness,
       });
@@ -116,15 +134,27 @@ export default function App() {
       p.connect();
     }
 
+    function onWsSync(synced: boolean) {
+      if (synced) {
+        wsSynced = true;
+        clearSyncTimeout();
+      }
+    }
+
     function onWsStatus(e: { status: string }) {
       setStatusFrom(e);
       if (e.status === "connected") {
         wsEverConnected = true;
-        if (connectTimeout !== undefined) {
-          clearTimeout(connectTimeout);
-          connectTimeout = undefined;
+        clearConnectTimeout();
+        if (!wsSynced && syncTimeout === undefined) {
+          syncTimeout = setTimeout(() => {
+            syncTimeout = undefined;
+            if (!cancelled && !wsSynced && current instanceof WebsocketProvider) {
+              switchToHttp();
+            }
+          }, WS_SYNC_TIMEOUT_MS);
         }
-      } else if (e.status === "disconnected" && !wsEverConnected) {
+      } else if (e.status === "disconnected" && !wsSynced) {
         switchToHttp();
       }
     }
@@ -135,9 +165,11 @@ export default function App() {
     });
     current = p;
     p.on("status", onWsStatus);
+    p.on("sync", onWsSync);
     p.connect();
 
     connectTimeout = setTimeout(() => {
+      connectTimeout = undefined;
       if (!cancelled && !wsEverConnected && current instanceof WebsocketProvider) {
         switchToHttp();
       }
@@ -145,8 +177,9 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      if (connectTimeout !== undefined) clearTimeout(connectTimeout);
-      if (current) teardown(current, onWsStatus);
+      clearConnectTimeout();
+      clearSyncTimeout();
+      if (current) teardown(current, onWsStatus, onWsSync);
     };
   }, [roomId, doc, awareness]);
 
