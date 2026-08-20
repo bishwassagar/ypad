@@ -1,0 +1,5 @@
+{
+  "name": "ypad",
+  "main": "party/server.ts",
+  "compatibilityDate": "2024-07-18"
+}
