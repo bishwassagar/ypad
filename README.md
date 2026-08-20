@@ -5,6 +5,18 @@ A minimalist, self-hosted collaborative text editor, inspired by
 everyone on that link edits the same document in real time. Documents persist
 in the cloud even when no one is connected.
 
+## Try it
+
+The app is live on both platforms, backed by the same Cloudflare sync worker:
+
+- **Cloudflare Pages** → https://ypad.pages.dev/
+- **GitHub Pages** → https://bishwassagar.github.io/ypad/
+
+Open the same link in two browser windows (or one normal + one incognito),
+type in one, and watch the other update live. Reload the page — content is
+persisted in the cloud. You can also fork this repo and deploy it to your own
+Cloudflare account and static host in minutes (see [Deploy](#deploy)).
+
 ## Features
 
 - Real-time collaborative editing (Yjs CRDT)
@@ -68,6 +80,19 @@ npm run build   # outputs to dist/
 
 Set `VITE_SYNC_HOST` to your deployed worker URL (e.g.
 `ypad.<username>.workers.dev`) at build time.
+
+### Automatic deploys
+
+This repo ships two GitHub Actions workflows that redeploy the frontend on
+every push to `main`:
+
+- `deploy-cloudflare-pages.yml` — builds and publishes `dist/` to Cloudflare
+  Pages (needs `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` repo secrets).
+- `deploy-gh-pages.yml` — builds with `--base=/ypad/` and publishes to GitHub
+  Pages.
+
+Fork the repo, wire up the two secrets (and your own sync worker), and both
+URLs update automatically on push.
 
 ## Verification
 
