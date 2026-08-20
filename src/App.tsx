@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as Y from "yjs";
-import YPartyKitProvider from "y-partykit/provider";
+import { WebsocketProvider } from "y-websocket";
 import { Languages, Moon, Share2, Sun } from "lucide-react";
 import { Editor } from "./editor";
 import { ShareModal } from "./share";
@@ -20,7 +20,12 @@ import { Dropdown } from "./ui/Dropdown";
 import { StatusDot, type ConnectionStatus } from "./ui/StatusDot";
 import { ToolbarButton } from "./ui/ToolbarButton";
 
-const PARTYKIT_HOST = import.meta.env.VITE_PARTYKIT_HOST ?? "localhost:1999";
+const SYNC_HOST = import.meta.env.VITE_SYNC_HOST ?? "localhost:8787";
+
+function syncServerUrl(): string {
+  const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/.test(SYNC_HOST);
+  return `${isLocal ? "ws" : "wss"}://${SYNC_HOST}`;
+}
 
 const CHARS = "abcdefghijklmnopqrstuvwxyz234567";
 
@@ -41,8 +46,8 @@ function roomIdFromHash(): string {
 export default function App() {
   const [roomId] = useState(roomIdFromHash);
   const [doc] = useState(() => new Y.Doc());
-  const providerRef = useRef<YPartyKitProvider | null>(null);
-  const [provider, setProvider] = useState<YPartyKitProvider | null>(null);
+  const providerRef = useRef<WebsocketProvider | null>(null);
+  const [provider, setProvider] = useState<WebsocketProvider | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [dark, setDark] = useState(loadTheme);
   const [language, setLanguage] = useState("plain");
@@ -59,7 +64,7 @@ export default function App() {
   }, [dark]);
 
   useEffect(() => {
-    const p = new YPartyKitProvider(PARTYKIT_HOST, roomId, doc, {
+    const p = new WebsocketProvider(syncServerUrl(), roomId, doc, {
       connect: false,
     });
     providerRef.current = p;

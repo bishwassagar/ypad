@@ -1,0 +1,10 @@
+name = "ypad"
+main = "worker/server.ts"
+compatibility_date = "2025-01-01"
+
+[durable_objects]
+bindings = [{ name = "YPAD_ROOM", class_name = "YpadRoom" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["YpadRoom"]

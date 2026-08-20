@@ -22,7 +22,7 @@ in the cloud even when no one is connected.
 | Layer      | Choice                                              |
 | ---------- | --------------------------------------------------- |
 | Sync       | Yjs CRDT (`Y.Doc` + `Y.Text`)                       |
-| Backend    | PartyKit + `y-partykit` (Cloudflare Workers / DOs)  |
+| Backend    | Cloudflare Worker + Durable Object (`y-websocket` wire protocol) |
 | Frontend   | React + Vite + TypeScript                           |
 | Editor     | CodeMirror 6 via `y-codemirror.next`                |
 | Styling    | Tailwind CSS v4                                     |
@@ -34,8 +34,8 @@ in the cloud even when no one is connected.
 ```bash
 npm install
 
-# Terminal 1: PartyKit backend (http://localhost:1999)
-npx partykit dev
+# Terminal 1: sync worker (http://localhost:8787)
+npm run server
 
 # Terminal 2: Vite frontend
 npm run dev
@@ -43,18 +43,22 @@ npm run dev
 
 Open the printed URL in two browser windows (or one normal + one incognito),
 type in one, and watch the other update live. Reloading keeps the content —
-it is persisted by the backend.
+it is persisted by the worker.
 
-`VITE_PARTYKIT_HOST` (see `.env.example`) overrides the PartyKit server URL,
-defaulting to `localhost:1999`.
+`VITE_SYNC_HOST` (see `.env.example`) overrides the sync worker URL,
+defaulting to `localhost:8787`.
 
 ## Deploy
 
 Backend (Cloudflare):
 
 ```bash
-npx partykit deploy
+npx wrangler login      # once, to authorize your Cloudflare account
+npm run server:deploy
 ```
+
+The worker uses a free `*.workers.dev` subdomain — no custom domain needed.
+Durable Object storage makes pads persist with zero clients connected.
 
 Frontend (any static host — Vercel, Netlify, GitHub Pages):
 
@@ -62,15 +66,14 @@ Frontend (any static host — Vercel, Netlify, GitHub Pages):
 npm run build   # outputs to dist/
 ```
 
-Set `VITE_PARTYKIT_HOST` to your deployed party URL (e.g.
-`ypad-<username>.partykit.dev`) at build time.
+Set `VITE_SYNC_HOST` to your deployed worker URL (e.g.
+`ypad.<username>.workers.dev`) at build time.
 
 ## Verification
 
 ```bash
-npx tsc --noEmit        # typecheck
-npm run build           # production build
-npx partykit dev        # local backend smoke test
+npm run build           # typecheck + production build
+npm run server          # local backend smoke test
 ```
 
 ## License
