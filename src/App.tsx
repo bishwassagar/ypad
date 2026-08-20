@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
+import { Awareness } from "y-protocols/awareness";
+import { HttpSyncProvider } from "./sync/httpProvider";
 import { Languages, Moon, Share2, Sun } from "lucide-react";
 import { Editor } from "./editor";
 import { ShareModal } from "./share";
@@ -21,10 +23,16 @@ import { StatusDot, type ConnectionStatus } from "./ui/StatusDot";
 import { ToolbarButton } from "./ui/ToolbarButton";
 
 const SYNC_HOST = import.meta.env.VITE_SYNC_HOST ?? "localhost:8787";
+const WS_CONNECT_TIMEOUT_MS = 5000;
 
 function syncServerUrl(): string {
   const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/.test(SYNC_HOST);
   return `${isLocal ? "ws" : "wss"}://${SYNC_HOST}`;
+}
+
+function httpSyncServerUrl(): string {
+  const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/.test(SYNC_HOST);
+  return `${isLocal ? "http" : "https"}://${SYNC_HOST}`;
 }
 
 const CHARS = "abcdefghijklmnopqrstuvwxyz234567";
@@ -43,11 +51,16 @@ function roomIdFromHash(): string {
   return fresh;
 }
 
+interface SyncProviderLike {
+  off(name: "status", f: (e: { status: string }) => void): unknown;
+  disconnect(): void;
+  destroy(): void;
+}
+
 export default function App() {
   const [roomId] = useState(roomIdFromHash);
   const [doc] = useState(() => new Y.Doc());
-  const providerRef = useRef<WebsocketProvider | null>(null);
-  const [provider, setProvider] = useState<WebsocketProvider | null>(null);
+  const [awareness] = useState(() => new Awareness(doc));
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [dark, setDark] = useState(loadTheme);
   const [language, setLanguage] = useState("plain");
@@ -64,13 +77,80 @@ export default function App() {
   }, [dark]);
 
   useEffect(() => {
+    let current: WebsocketProvider | HttpSyncProvider | null = null;
+    let wsEverConnected = false;
+    let connectTimeout: number | undefined;
+    let cancelled = false;
+
+    function setStatusFrom(e: { status: string }) {
+      if (
+        e.status === "connecting" ||
+        e.status === "connected" ||
+        e.status === "disconnected"
+      ) {
+        setStatus(e.status);
+      }
+    }
+
+    function teardown(
+      p: SyncProviderLike,
+      handler: (e: { status: string }) => void
+    ) {
+      p.off("status", handler);
+      p.disconnect();
+      p.destroy();
+    }
+
+    function switchToHttp() {
+      if (cancelled || current instanceof HttpSyncProvider) return;
+      if (connectTimeout !== undefined) {
+        clearTimeout(connectTimeout);
+        connectTimeout = undefined;
+      }
+      if (current) teardown(current, onWsStatus);
+      const p = new HttpSyncProvider(httpSyncServerUrl(), roomId, doc, {
+        awareness,
+      });
+      current = p;
+      p.on("status", setStatusFrom);
+      p.connect();
+    }
+
+    function onWsStatus(e: { status: string }) {
+      setStatusFrom(e);
+      if (e.status === "connected") {
+        wsEverConnected = true;
+        if (connectTimeout !== undefined) {
+          clearTimeout(connectTimeout);
+          connectTimeout = undefined;
+        }
+      } else if (e.status === "disconnected" && !wsEverConnected) {
+        switchToHttp();
+      }
+    }
+
     const p = new WebsocketProvider(syncServerUrl(), roomId, doc, {
       connect: false,
+      awareness,
     });
-    providerRef.current = p;
-    setProvider(p);
+    current = p;
+    p.on("status", onWsStatus);
+    p.connect();
 
-    const awareness = p.awareness;
+    connectTimeout = setTimeout(() => {
+      if (!cancelled && !wsEverConnected && current instanceof WebsocketProvider) {
+        switchToHttp();
+      }
+    }, WS_CONNECT_TIMEOUT_MS);
+
+    return () => {
+      cancelled = true;
+      if (connectTimeout !== undefined) clearTimeout(connectTimeout);
+      if (current) teardown(current, onWsStatus);
+    };
+  }, [roomId, doc, awareness]);
+
+  useEffect(() => {
     awareness.setLocalStateField("user", userRef.current);
 
     const onAwareness = () => {
@@ -85,29 +165,11 @@ export default function App() {
       }
     };
 
-    const onStatus = (e: { status: string }) => {
-      if (
-        e.status === "connecting" ||
-        e.status === "connected" ||
-        e.status === "disconnected"
-      ) {
-        setStatus(e.status);
-      }
-    };
-
     awareness.on("change", onAwareness);
-    p.on("status", onStatus);
-    p.connect();
-
     return () => {
       awareness.off("change", onAwareness);
-      p.off("status", onStatus);
-      p.disconnect();
-      p.destroy();
-      providerRef.current = null;
-      setProvider(null);
     };
-  }, [roomId, doc]);
+  }, [awareness]);
 
   useEffect(() => {
     const meta = doc.getMap<string>("ypad");
@@ -131,8 +193,8 @@ export default function App() {
     userRef.current = next;
     setUser(next);
     persistUser(next);
-    providerRef.current?.awareness.setLocalStateField("user", next);
-  }, []);
+    awareness.setLocalStateField("user", next);
+  }, [awareness]);
 
   const saveName = () => {
     const name = nameDraft.trim() || "Anonymous";
@@ -249,9 +311,7 @@ export default function App() {
       </header>
 
       <main className="relative min-h-0 flex-1">
-        {provider && (
-          <Editor doc={doc} awareness={provider.awareness} dark={dark} language={language} />
-        )}
+        <Editor doc={doc} awareness={awareness} dark={dark} language={language} />
         {empty && status === "connected" && (
           <div className="pointer-events-none absolute inset-0 flex items-start justify-center pt-16">
             <p className="rounded-md bg-white/60 px-3 py-1 text-sm text-neutral-500 backdrop-blur dark:bg-neutral-950/60 dark:text-neutral-400">
