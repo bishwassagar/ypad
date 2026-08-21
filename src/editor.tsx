@@ -7,6 +7,7 @@ import { yCollab } from "y-codemirror.next";
 import type { Awareness } from "y-protocols/awareness";
 import { cmTheme } from "./editorTheme";
 import { loadLanguage } from "./language";
+import { smartPaste } from "./smartPaste";
 
 interface EditorProps {
   doc: Y.Doc;
@@ -27,7 +28,7 @@ export function Editor({ doc, awareness, dark, language }: EditorProps) {
     if (!host) return;
 
     const ytext = doc.getText("content");
-    const undoManager = new Y.UndoManager(ytext);
+    const undoManager = new Y.UndoManager([ytext]);
 
     const view = new EditorView({
       parent: host,
@@ -38,6 +39,7 @@ export function Editor({ doc, awareness, dark, language }: EditorProps) {
           basicSetup,
           themeRef.current.of(cmTheme(dark)),
           languageRef.current.of([]),
+          smartPaste(),
         ],
       }),
     });

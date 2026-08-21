@@ -3,8 +3,9 @@ import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { Awareness } from "y-protocols/awareness";
 import { HttpSyncProvider } from "./sync/httpProvider";
-import { Languages, Moon, Share2, Sun } from "lucide-react";
+import { Languages, Moon, Share2, Sun, Table2 } from "lucide-react";
 import { Editor } from "./editor";
+import { Sheet } from "./Sheet";
 import { ShareModal } from "./share";
 import {
   loadTheme,
@@ -25,6 +26,8 @@ import { ToolbarButton } from "./ui/ToolbarButton";
 const SYNC_HOST = import.meta.env.VITE_SYNC_HOST ?? "localhost:8787";
 const WS_CONNECT_TIMEOUT_MS = 5000;
 const WS_SYNC_TIMEOUT_MS = 10000;
+
+type EditorMode = "text" | "excel";
 
 function syncServerUrl(): string {
   const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/.test(SYNC_HOST);
@@ -66,6 +69,7 @@ export default function App() {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [dark, setDark] = useState(loadTheme);
   const [language, setLanguage] = useState("plain");
+  const [mode, setMode] = useState<EditorMode>("text");
   const [empty, setEmpty] = useState(true);
   const [shareOpen, setShareOpen] = useState(false);
   const [peers, setPeers] = useState<Peer[]>([]);
@@ -210,6 +214,8 @@ export default function App() {
     const onMeta = () => {
       const value = meta.get("language");
       if (value) setLanguage(value);
+      const nextMode = meta.get("mode");
+      if (nextMode === "text" || nextMode === "excel") setMode(nextMode);
     };
     const onText = () => setEmpty(ytext.length === 0);
     meta.observe(onMeta);
@@ -249,6 +255,12 @@ export default function App() {
     doc.getMap<string>("ypad").set("language", id);
   };
 
+  const toggleMode = () => {
+    const next: EditorMode = mode === "text" ? "excel" : "text";
+    setMode(next);
+    doc.getMap<string>("ypad").set("mode", next);
+  };
+
   const currentLangLabel = languageLabel(language);
 
   return (
@@ -267,6 +279,18 @@ export default function App() {
         <div className="flex-1" />
 
         <StatusDot status={status} />
+
+        <ToolbarButton
+          onClick={toggleMode}
+          title={mode === "excel" ? "Switch to text mode" : "Switch to excel mode"}
+          className={
+            mode === "excel"
+              ? "bg-neutral-200 text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100"
+              : ""
+          }
+        >
+          <Table2 size={16} />
+        </ToolbarButton>
 
         <Dropdown
           align="right"
@@ -344,8 +368,12 @@ export default function App() {
       </header>
 
       <main className="relative min-h-0 flex-1">
-        <Editor doc={doc} awareness={awareness} dark={dark} language={language} />
-        {empty && status === "connected" && (
+        {mode === "excel" ? (
+          <Sheet doc={doc} />
+        ) : (
+          <Editor doc={doc} awareness={awareness} dark={dark} language={language} />
+        )}
+        {empty && status === "connected" && mode === "text" && (
           <div className="pointer-events-none absolute inset-0 flex items-start justify-center pt-16">
             <p className="rounded-md bg-white/60 px-3 py-1 text-sm text-neutral-500 backdrop-blur dark:bg-neutral-950/60 dark:text-neutral-400">
               Start typing — anyone with the link can join.
