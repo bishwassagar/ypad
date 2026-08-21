@@ -12,6 +12,9 @@ export const messageAwareness = 1;
 
 const FLUSH_INTERVAL_MS = 80;
 const MAX_BATCH_MESSAGES = 50;
+// Free-tier Durable Object duration is billed per second while an SSE stream
+// is held open, so background tabs must not keep one alive.
+const DEFAULT_MAX_BACKOFF_MS = 30_000;
 
 export interface HttpSyncProviderEvents {
   status: (event: { status: "connecting" | "connected" | "disconnected" }) => void;
@@ -65,8 +68,9 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
     this.roomname = roomname;
     this.doc = doc;
     this.awareness = opts.awareness ?? new awarenessProtocol.Awareness(doc);
-    this.maxBackoffTime = opts.maxBackoffTime ?? 2500;
+    this.maxBackoffTime = opts.maxBackoffTime ?? DEFAULT_MAX_BACKOFF_MS;
     this.token = crypto.randomUUID();
+    document.addEventListener("visibilitychange", this.onVisibility);
 
     this._updateHandler = (update, origin) => {
       if (origin !== this) {
@@ -130,10 +134,31 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
 
   destroy(): void {
     this.disconnect();
+    document.removeEventListener("visibilitychange", this.onVisibility);
     this.awareness.off("update", this._awarenessUpdateHandler);
     this.doc.off("update", this._updateHandler);
     super.destroy();
   }
+
+  // Closing the stream while the tab is hidden stops DO duration billing for
+  // background tabs; outgoing edits still sync via POST round-trips, and the
+  // handshake on reopen resyncs anything missed.
+  private onVisibility = (): void => {
+    if (!this.shouldConnect) return;
+    if (document.hidden) {
+      if (this.es !== null) {
+        this.es.close();
+        this.es = null;
+        this.wasConnected = false;
+      }
+      if (this.reconnectTimer !== undefined) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = undefined;
+      }
+    } else if (this.es === null) {
+      this.openStream();
+    }
+  };
 
   private openStream(): void {
     if (!this.shouldConnect || this.es !== null) return;
