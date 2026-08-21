@@ -170,12 +170,85 @@ const awRes = await post(aw);
 check("POST awareness status 200", awRes.status === 200);
 check("POST awareness empty reply", (await awRes.arrayBuffer()).byteLength === 0);
 
-// 6. OPTIONS preflight
+function concatBytes(...arrs) {
+  const total = arrs.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const a of arrs) {
+    out.set(a, off);
+    off += a.length;
+  }
+  return out;
+}
+
+// 6. Multi-frame POST: several protocol frames in one body are all applied
+const docA = new Y.Doc();
+docA.getText("content").insert(0, "A");
+const docB = new Y.Doc();
+docB.getText("content").insert(0, "B");
+const batchRes = await post(concatBytes(frameUpdate(docA), frameUpdate(docB)));
+check("multi-frame POST status 200", batchRes.status === 200);
+await batchRes.arrayBuffer();
+const probeRes = await post(frameSyncStep1(new Y.Doc()));
+const probeDoc = new Y.Doc();
+readSync(new Uint8Array(await probeRes.arrayBuffer()), probeDoc);
+const probeText = probeDoc.getText("content").toString();
+check(
+  "multi-frame POST applies all updates",
+  probeText.includes("A") && probeText.includes("B"),
+  `got ${JSON.stringify(probeText)}`
+);
+
+// 7. Multi-frame replies: syncStep1 + queryAwareness in one body -> two
+//    concatenated reply frames (syncStep2 + awareness)
+function frameQueryAwareness() {
+  const enc = encoding.createEncoder();
+  encoding.writeVarUint(enc, 3); // messageQueryAwareness
+  return encoding.toUint8Array(enc);
+}
+const comboRes = await post(
+  concatBytes(frameSyncStep1(new Y.Doc()), frameQueryAwareness())
+);
+check("combo POST status 200", comboRes.status === 200);
+const comboBytes = new Uint8Array(await comboRes.arrayBuffer());
+let sawStep2 = false;
+let sawAwarenessFrame = false;
+{
+  const d = decoding.createDecoder(comboBytes);
+  try {
+    while (d.pos < d.arr.length) {
+      const t = decoding.readVarUint(d);
+      if (t === messageSync) {
+        const e2 = encoding.createEncoder();
+        if (
+          syncProtocol.readSyncMessage(d, e2, new Y.Doc(), null) ===
+          syncProtocol.messageYjsSyncStep2
+        ) {
+          sawStep2 = true;
+        }
+      } else if (t === messageAwareness) {
+        decoding.readVarUint8Array(d);
+        sawAwarenessFrame = true;
+      } else {
+        break;
+      }
+    }
+  } catch {
+    // truncated tail
+  }
+}
+check(
+  "reply carries syncStep2 + awareness concatenated",
+  sawStep2 && sawAwarenessFrame,
+  `step2=${sawStep2} awareness=${sawAwarenessFrame}`
+);
+
+// 8. OPTIONS preflight
 const opt = await fetch(`${BASE}/${ROOM}?transport=http`, { method: "OPTIONS", headers: { Origin: "https://ypad.pages.dev", "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "content-type" } });
 check("OPTIONS 204", opt.status === 204);
 check("OPTIONS ACAO *", opt.headers.get("access-control-allow-origin") === "*");
 
-// 7. wrong method
+// 9. wrong method
 const bad = await fetch(`${BASE}/${ROOM}?transport=http`, { method: "DELETE" });
 check("DELETE -> 405", bad.status === 405);
 

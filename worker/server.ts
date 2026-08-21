@@ -203,6 +203,13 @@ export class YpadRoom extends DurableObject<Env> {
     }, SSE_KEEPALIVE_MS);
     this.sseTimers.set(client, timer);
 
+    // Tell the browser's EventSource to wait 5s between reconnect attempts
+    // instead of hammering the worker every ~3s when the stream drops.
+    void writer.write(text.encode("retry: 5000\n\n")).catch(() => {
+      closed = true;
+      this.closeConn(client);
+    });
+
     this.sendInitialState(client);
 
     return new Response(readable, {
@@ -262,40 +269,46 @@ export class YpadRoom extends DurableObject<Env> {
   }
 
   private handleMessage(client: Client | null, message: Uint8Array): Uint8Array | null {
+    const replies = encoding.createEncoder();
     try {
       const decoder = decoding.createDecoder(message);
-      const encoder = encoding.createEncoder();
-      const messageType = decoding.readVarUint(decoder);
-      switch (messageType) {
-        case messageSync:
-          encoding.writeVarUint(encoder, messageSync);
-          syncProtocol.readSyncMessage(decoder, encoder, this.doc, client);
-          if (encoding.length(encoder) > 1) return encoding.toUint8Array(encoder);
-          return null;
-        case messageAwareness:
-          awarenessProtocol.applyAwarenessUpdate(
-            this.awareness,
-            decoding.readVarUint8Array(decoder),
-            client
-          );
-          return null;
-        case messageQueryAwareness: {
-          const aEncoder = encoding.createEncoder();
-          encoding.writeVarUint(aEncoder, messageAwareness);
-          encoding.writeVarUint8Array(
-            aEncoder,
-            awarenessProtocol.encodeAwarenessUpdate(
+      while (decoder.pos < decoder.arr.length) {
+        const encoder = encoding.createEncoder();
+        const messageType = decoding.readVarUint(decoder);
+        switch (messageType) {
+          case messageSync:
+            encoding.writeVarUint(encoder, messageSync);
+            syncProtocol.readSyncMessage(decoder, encoder, this.doc, client);
+            if (encoding.length(encoder) > 1) {
+              encoding.writeUint8Array(replies, encoding.toUint8Array(encoder));
+            }
+            break;
+          case messageAwareness:
+            awarenessProtocol.applyAwarenessUpdate(
               this.awareness,
-              Array.from(this.awareness.getStates().keys())
-            )
-          );
-          return encoding.toUint8Array(aEncoder);
+              decoding.readVarUint8Array(decoder),
+              client
+            );
+            break;
+          case messageQueryAwareness: {
+            const aEncoder = encoding.createEncoder();
+            encoding.writeVarUint(aEncoder, messageAwareness);
+            encoding.writeVarUint8Array(
+              aEncoder,
+              awarenessProtocol.encodeAwarenessUpdate(
+                this.awareness,
+                Array.from(this.awareness.getStates().keys())
+              )
+            );
+            encoding.writeUint8Array(replies, encoding.toUint8Array(aEncoder));
+            break;
+          }
         }
       }
-      return null;
     } catch {
-      return null;
+      // truncated or corrupt trailing frame: keep the replies gathered so far
     }
+    return encoding.length(replies) > 0 ? encoding.toUint8Array(replies) : null;
   }
 
   private closeConn(client: Client) {

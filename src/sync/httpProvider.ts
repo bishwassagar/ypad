@@ -10,6 +10,9 @@ import type { Awareness } from "y-protocols/awareness";
 export const messageSync = 0;
 export const messageAwareness = 1;
 
+const FLUSH_INTERVAL_MS = 80;
+const MAX_BATCH_MESSAGES = 50;
+
 export interface HttpSyncProviderEvents {
   status: (event: { status: "connecting" | "connected" | "disconnected" }) => void;
 }
@@ -19,6 +22,10 @@ export interface HttpSyncProviderEvents {
  * server -> client via SSE, client -> server via POST. Used as a fallback when
  * the network blocks WebSocket upgrades (SSE is a plain HTTP GET/POST and passes
  * through most proxies and captive portals).
+ *
+ * Outgoing frames are queued and flushed as one concatenated batch per ~80ms to
+ * keep request counts low; the server parses concatenated frames and replies in
+ * kind. POSTs use a CORS-simple content type so browsers never preflight.
  */
 export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
   serverUrl: string;
@@ -34,6 +41,9 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
   private maxBackoffTime: number;
   private reconnectAttempts = 0;
   private reconnectTimer: number | undefined;
+  private outbox: Uint8Array[] = [];
+  private flushTimer: number | undefined;
+  private flushing = false;
   private _updateHandler: (update: Uint8Array, origin: unknown) => void;
   private _awarenessUpdateHandler: (arg0: {
     added: number[];
@@ -63,7 +73,7 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, messageSync);
         syncProtocol.writeUpdate(encoder, update);
-        this.post(encoding.toUint8Array(encoder));
+        this.send(encoding.toUint8Array(encoder));
       }
     };
     this._awarenessUpdateHandler = ({ added, updated, removed }) => {
@@ -74,7 +84,7 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
         encoder,
         awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients)
       );
-      this.post(encoding.toUint8Array(encoder));
+      this.send(encoding.toUint8Array(encoder));
     };
 
     this.doc.on("update", this._updateHandler);
@@ -101,6 +111,11 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    if (this.flushTimer !== undefined) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+    this.outbox = [];
     if (this.es !== null) {
       this.es.close();
       this.es = null;
@@ -137,7 +152,7 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, messageSync);
       syncProtocol.writeSyncStep1(encoder, this.doc);
-      void this.post(encoding.toUint8Array(encoder));
+      this.send(encoding.toUint8Array(encoder));
 
       if (this.awareness.getLocalState() !== null) {
         const aEncoder = encoding.createEncoder();
@@ -146,16 +161,17 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
           aEncoder,
           awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID])
         );
-        void this.post(encoding.toUint8Array(aEncoder));
+        this.send(encoding.toUint8Array(aEncoder));
       }
+      void this.flush();
     };
 
     es.onmessage = (event) => {
       if (this.es !== es) return;
       const buf = fromBase64(event.data as string);
-      const encoder = this.readMessage(buf, true);
+      const encoder = this.readFrames(buf);
       if (encoding.length(encoder) > 1) {
-        void this.post(encoding.toUint8Array(encoder));
+        this.send(encoding.toUint8Array(encoder));
       }
     };
 
@@ -187,44 +203,99 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
     }, delay);
   }
 
-  private readMessage(buf: Uint8Array, emitSynced: boolean): encoding.Encoder {
-    const decoder = decoding.createDecoder(buf);
-    const encoder = encoding.createEncoder();
-    const messageType = decoding.readVarUint(decoder);
-    if (messageType === messageSync) {
-      encoding.writeVarUint(encoder, messageSync);
-      const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
-      if (
-        emitSynced &&
-        syncMessageType === syncProtocol.messageYjsSyncStep2 &&
-        !this.synced
-      ) {
-        this.synced = true;
-      }
-    } else if (messageType === messageAwareness) {
-      awarenessProtocol.applyAwarenessUpdate(
-        this.awareness,
-        decoding.readVarUint8Array(decoder),
-        this
-      );
+  private send(buf: Uint8Array): void {
+    if (!this.shouldConnect) return;
+    this.outbox.push(buf);
+    if (this.outbox.length >= MAX_BATCH_MESSAGES) {
+      void this.flush();
+      return;
     }
-    return encoder;
+    if (this.flushTimer === undefined) {
+      this.flushTimer = window.setTimeout(() => {
+        this.flushTimer = undefined;
+        void this.flush();
+      }, FLUSH_INTERVAL_MS);
+    }
   }
 
-  private async post(buf: Uint8Array): Promise<void> {
+  private async flush(): Promise<void> {
+    if (this.flushTimer !== undefined) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+    if (this.flushing) return;
+    this.flushing = true;
+    try {
+      while (this.shouldConnect && this.outbox.length > 0) {
+        const batch = this.outbox;
+        this.outbox = [];
+        let total = 0;
+        for (const b of batch) total += b.length;
+        const body = new Uint8Array(total);
+        let off = 0;
+        for (const b of batch) {
+          body.set(b, off);
+          off += b.length;
+        }
+        await this.post(body);
+      }
+    } finally {
+      this.flushing = false;
+    }
+  }
+
+  private readFrames(buf: Uint8Array): encoding.Encoder {
+    const decoder = decoding.createDecoder(buf);
+    const out = encoding.createEncoder();
+    try {
+      while (decoder.pos < decoder.arr.length) {
+        const messageType = decoding.readVarUint(decoder);
+        const encoder = encoding.createEncoder();
+        if (messageType === messageSync) {
+          encoding.writeVarUint(encoder, messageSync);
+          const syncMessageType = syncProtocol.readSyncMessage(
+            decoder,
+            encoder,
+            this.doc,
+            this
+          );
+          if (
+            syncMessageType === syncProtocol.messageYjsSyncStep2 &&
+            !this.synced
+          ) {
+            this.synced = true;
+          }
+        } else if (messageType === messageAwareness) {
+          awarenessProtocol.applyAwarenessUpdate(
+            this.awareness,
+            decoding.readVarUint8Array(decoder),
+            this
+          );
+        }
+        if (encoding.length(encoder) > 1) {
+          encoding.writeUint8Array(out, encoding.toUint8Array(encoder));
+        }
+      }
+    } catch {
+      // truncated or corrupt trailing frame: keep what we decoded
+    }
+    return out;
+  }
+
+  private async post(body: Uint8Array): Promise<void> {
     if (!this.shouldConnect) return;
     try {
       const res = await fetch(`${this.url}?transport=http&token=${this.token}`, {
         method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: new Uint8Array(buf),
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        body: new Uint8Array(body),
       });
       if (!res.ok) return;
       const reply = new Uint8Array(await res.arrayBuffer());
       if (reply.length > 0) {
-        const encoder = this.readMessage(reply, true);
+        const encoder = this.readFrames(reply);
         if (encoding.length(encoder) > 1) {
-          await this.post(encoding.toUint8Array(encoder));
+          this.send(encoding.toUint8Array(encoder));
         }
       }
     } catch {
