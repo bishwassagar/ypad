@@ -23,6 +23,7 @@ function toBase64(bytes: Uint8Array): string {
 const STATE_KEY = "state";
 const PERSIST_DEBOUNCE_MS = 500;
 const SSE_KEEPALIVE_MS = 15_000;
+const ROOM_TTL_MS = 48 * 60 * 60 * 1000;
 
 // A bidirectional byte channel. WebSockets and SSE+POST clients both implement it.
 interface Client {
@@ -32,6 +33,7 @@ interface Client {
 
 interface Env {
   YPAD_ROOM: DurableObjectNamespace<YpadRoom>;
+  ROOM_TTL_MS?: string;
 }
 
 export default {
@@ -54,10 +56,19 @@ export class YpadRoom extends DurableObject<Env> {
   private wsClients = new Map<WebSocket, Client>();
   private sseTimers = new Map<Client, ReturnType<typeof setInterval>>();
   private loaded = false;
+  private deleted = false;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private ttlMs: number;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.ttlMs = Number(env.ROOM_TTL_MS ?? "") || ROOM_TTL_MS;
+    this.initDoc();
+  }
+
+  private initDoc(): void {
+    this.doc = new Y.Doc();
+    this.awareness = new awarenessProtocol.Awareness(this.doc);
     this.doc.on("update", (update) => {
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, messageSync);
@@ -106,7 +117,9 @@ export class YpadRoom extends DurableObject<Env> {
     return this.handleHttp(request);
   }
 
-  private handleWebSocket(): Response {
+  private async handleWebSocket(): Promise<Response> {
+    await this.ctx.storage.deleteAlarm();
+    this.deleted = false;
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -148,10 +161,18 @@ export class YpadRoom extends DurableObject<Env> {
       return this.handleSse(request);
     }
     if (request.method === "POST") {
+      const reqUrl = new URL(request.url);
+      const token = reqUrl.searchParams.get("token");
+      // Explicit goodbye from the client (fetch keepalive survives navigation;
+      // the abort signal below covers harder kills where supported).
+      if (reqUrl.searchParams.get("close") === "1" && token) {
+        const closing = this.clientsByToken.get(token);
+        if (closing) closing.close();
+        return new Response(null, { headers: { ...cors } });
+      }
       const body = new Uint8Array(await request.arrayBuffer());
       let reply: Uint8Array | null = null;
       if (body.length > 0) {
-        const token = new URL(request.url).searchParams.get("token");
         const client = (token ? this.clientsByToken.get(token) : undefined) ?? null;
         reply = this.handleMessage(client, body);
       }
@@ -162,7 +183,9 @@ export class YpadRoom extends DurableObject<Env> {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  private handleSse(request: Request): Response {
+  private async handleSse(request: Request): Promise<Response> {
+    await this.ctx.storage.deleteAlarm();
+    this.deleted = false;
     const token = new URL(request.url).searchParams.get("token") ?? crypto.randomUUID();
 
     const { readable, writable } = new TransformStream<Uint8Array>();
@@ -170,17 +193,27 @@ export class YpadRoom extends DurableObject<Env> {
     const text = new TextEncoder();
     let closed = false;
 
+    // Writes into an abandoned stream don't reject in workerd, so detect
+    // client disconnects via the request abort signal instead.
+    const onAbort = () => {
+      closed = true;
+      this.closeConn(client);
+    };
+    request.signal.addEventListener("abort", onAbort, { once: true });
+
     const client: Client = {
       send: (message) => {
         if (closed) return;
         void writer.write(text.encode(`data: ${toBase64(message)}\n\n`)).catch(() => {
           closed = true;
+          request.signal.removeEventListener("abort", onAbort);
           this.closeConn(client);
         });
       },
       close: () => {
         if (closed) return;
         closed = true;
+        request.signal.removeEventListener("abort", onAbort);
         const timer = this.sseTimers.get(client);
         if (timer !== undefined) {
           clearInterval(timer);
@@ -328,8 +361,27 @@ export class YpadRoom extends DurableObject<Env> {
       );
     }
     if (this.conns.size === 0) {
-      void this.persist();
+      void this.finalizeDisconnect();
     }
+  }
+
+  // Last one out: persist final state, then arm the expiry countdown. Anyone
+  // joining before it fires cancels the alarm.
+  private async finalizeDisconnect(): Promise<void> {
+    await this.persist();
+    await this.ctx.storage.setAlarm(Date.now() + this.ttlMs);
+  }
+
+  async alarm(): Promise<void> {
+    if (this.conns.size > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + this.ttlMs);
+      return;
+    }
+    this.deleted = true;
+    await this.ctx.storage.deleteAll();
+    await this.ctx.storage.deleteAlarm();
+    this.initDoc();
+    this.loaded = true;
   }
 
   private broadcast(message: Uint8Array) {
@@ -346,6 +398,7 @@ export class YpadRoom extends DurableObject<Env> {
   }
 
   private schedulePersist() {
+    if (this.deleted) return;
     if (this.persistTimer) clearTimeout(this.persistTimer);
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
@@ -354,6 +407,7 @@ export class YpadRoom extends DurableObject<Env> {
   }
 
   private async persist() {
+    if (this.deleted) return;
     await this.ctx.storage.put(STATE_KEY, Y.encodeStateAsUpdate(this.doc));
   }
 }

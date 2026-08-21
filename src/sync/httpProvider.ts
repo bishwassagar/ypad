@@ -124,6 +124,7 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
       this.es.close();
       this.es = null;
     }
+    this.signalClose();
     awarenessProtocol.removeAwarenessStates(
       this.awareness,
       [this.doc.clientID],
@@ -146,6 +147,7 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
   private onVisibility = (): void => {
     if (!this.shouldConnect) return;
     if (document.hidden) {
+      this.signalClose();
       if (this.es !== null) {
         this.es.close();
         this.es = null;
@@ -159,6 +161,19 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
       this.openStream();
     }
   };
+
+  // Tell the server to drop our SSE registration so room expiry can start
+  // counting from the real last disconnect. keepalive lets it race navigation.
+  private signalClose(): void {
+    try {
+      void fetch(`${this.url}?transport=http&token=${this.token}&close=1`, {
+        method: "POST",
+        keepalive: true,
+      }).catch(() => {});
+    } catch {
+      // best effort only
+    }
+  }
 
   private openStream(): void {
     if (!this.shouldConnect || this.es !== null) return;
