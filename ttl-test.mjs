@@ -97,4 +97,25 @@ for (let i = 0; i < 10 && !wipedB; i++) {
 }
 check("room B wiped after final disconnect", wipedB);
 
+// --- Room C: idle past hibernation threshold, then token ops must still resolve ---
+const roomC = `ttl-c-${Date.now()}`;
+await post(roomC, frameUpdate(src));
+{
+  const res = await fetch(`${BASE}/${roomC}?transport=http&token=t9`, { headers: { Accept: "text/event-stream" } });
+  const reader = res.body.getReader();
+  await reader.read(); // initial state
+  // hold the socket open but idle >10s so the DO can hibernate
+  await new Promise((r) => setTimeout(r, 12000));
+  const t = serverText(await post(roomC, frameSyncStep1(new Y.Doc())));
+  check("post-idle token attribution works", t === "TTL-CHECK", `got ${JSON.stringify(t)}`);
+  await reader.cancel();
+  await fetch(`${BASE}/${roomC}?transport=http&token=t9&close=1`, { method: "POST" });
+}
+let wipedC = false;
+for (let i = 0; i < 10 && !wipedC; i++) {
+  await new Promise((r) => setTimeout(r, 3000));
+  if (serverText(await post(roomC, frameSyncStep1(new Y.Doc()))) === "") wipedC = true;
+}
+check("close beacon resolves post-idle (arms TTL)", wipedC);
+
 process.exit(failures === 0 ? 0 : 1);
