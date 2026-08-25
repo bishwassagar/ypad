@@ -2,9 +2,16 @@ import { EditorView } from "@codemirror/view";
 import type { Extension } from "@codemirror/state";
 
 export function parseTableClipboard(cd: DataTransfer): string[][] | null {
-  const html = cd.getData("text/html");
-  const plain = cd.getData("text/plain");
-  return (html && rowsFromHtml(html)) || rowsFromTsv(plain);
+  return parseTableText(cd.getData("text/html"), cd.getData("text/plain"));
+}
+
+export function parseTableText(
+  html: string | undefined,
+  plain: string | undefined
+): string[][] | null {
+  // TSV wins over HTML so multiline cells survive round-trips; Excel,
+  // Google Sheets and YPad all emit proper quoted TSV alongside HTML.
+  return rowsFromTsv(plain) ?? (html ? rowsFromHtml(html) : null);
 }
 
 function rowsFromHtml(html: string): string[][] | null {
@@ -22,12 +29,61 @@ function rowsFromHtml(html: string): string[][] | null {
   return rows.length > 0 ? rows : null;
 }
 
-function rowsFromTsv(plain: string): string[][] | null {
-  if (!plain.includes("\t")) return null;
-  return plain
-    .split(/\r?\n/)
-    .filter((line) => line.length > 0)
-    .map((line) => line.split("\t").map((cell) => cell.trim()));
+function rowsFromTsv(plain: string | undefined): string[][] | null {
+  if (!plain || !plain.includes("\t")) return null;
+  // Strip exactly one trailing newline so a copied line ending doesn't
+  // create an extra populated row.
+  const text = plain.replace(/\r\n/g, "\n").replace(/\n$/, "");
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  let i = 0;
+  const endField = () => {
+    row.push(field);
+    field = "";
+  };
+  const endRow = () => {
+    endField();
+    rows.push(row);
+    row = [];
+  };
+  while (i < text.length) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+      } else {
+        field += ch;
+      }
+      i++;
+      continue;
+    }
+    if (ch === '"' && field.length === 0) {
+      inQuotes = true;
+      i++;
+      continue;
+    }
+    if (ch === "\t") {
+      endField();
+      i++;
+      continue;
+    }
+    if (ch === "\n") {
+      endRow();
+      i++;
+      continue;
+    }
+    field += ch;
+    i++;
+  }
+  endRow();
+  return rows;
 }
 
 function markdownTable(rows: string[][]): string {
