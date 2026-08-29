@@ -28,6 +28,11 @@ Cloudflare account and static host in minutes (see [Deploy](#deploy)).
 - Cloud persistence — pads survive all clients disconnecting
 - Share link with copy-to-clipboard
 - No auth: anyone with the link can edit (same as Rustpad)
+- **Collaborative spreadsheet mode** — toggle the top bar to a CRDT-backed grid
+  (`src/sheet.ts` / `src/Sheet.tsx`) with row/column insert/delete, range
+  copy/cut/clear, and TSV paste. View mode is local; language stays shared.
+- **Smart paste** — `src/smartPaste.ts` turns a TSV/HTML clipboard selection
+  into a Markdown table in the text editor (and grid cells in spreadsheet mode).
 
 ## Stack
 

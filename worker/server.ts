@@ -284,7 +284,15 @@ export class YpadRoom extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket) {
+    const controlled = this.controlled.get(ws);
     this.controlled.delete(ws);
+    if (controlled && controlled.size > 0) {
+      awarenessProtocol.removeAwarenessStates(
+        this.awareness,
+        Array.from(controlled),
+        "websocket close"
+      );
+    }
     const rest = this.ctx.getWebSockets().filter((w) => w !== ws);
     if (rest.length === 0) {
       void this.finalizeDisconnect();
@@ -292,7 +300,15 @@ export class YpadRoom extends DurableObject<Env> {
   }
 
   async webSocketError(ws: WebSocket) {
+    const controlled = this.controlled.get(ws);
     this.controlled.delete(ws);
+    if (controlled && controlled.size > 0) {
+      awarenessProtocol.removeAwarenessStates(
+        this.awareness,
+        Array.from(controlled),
+        "websocket error"
+      );
+    }
     try {
       ws.close(1000, "error");
     } catch {}

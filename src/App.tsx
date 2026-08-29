@@ -26,6 +26,9 @@ import { ToolbarButton } from "./ui/ToolbarButton";
 const SYNC_HOST = import.meta.env.VITE_SYNC_HOST ?? "localhost:8787";
 const WS_CONNECT_TIMEOUT_MS = 5000;
 const WS_SYNC_TIMEOUT_MS = 10000;
+// Tear the DO connection down after this much local inactivity so the Durable
+// Object can hibernate; wall-clock duration is the free-tier constraint.
+const IDLE_DISCONNECT_MS = 90_000;
 
 type EditorMode = "text" | "excel";
 
@@ -58,6 +61,7 @@ function roomIdFromHash(): string {
 interface SyncProviderLike {
   off(name: "status", f: (e: { status: string }) => void): unknown;
   off(name: "sync", f: (synced: boolean) => void): unknown;
+  connect(): void;
   disconnect(): void;
   destroy(): void;
 }
@@ -88,7 +92,10 @@ export default function App() {
     let wsSynced = false;
     let connectTimeout: number | undefined;
     let syncTimeout: number | undefined;
+    let idleTimer: number | undefined;
     let cancelled = false;
+    let wantConnect = true;
+    let lastActivity = 0;
 
     function setStatusFrom(e: { status: string }) {
       if (
@@ -125,6 +132,16 @@ export default function App() {
       }
     }
 
+    function armConnectTimeout() {
+      clearConnectTimeout();
+      connectTimeout = setTimeout(() => {
+        connectTimeout = undefined;
+        if (!cancelled && !wsEverConnected && current instanceof WebsocketProvider) {
+          switchToHttp();
+        }
+      }, WS_CONNECT_TIMEOUT_MS);
+    }
+
     function switchToHttp() {
       if (cancelled || current instanceof HttpSyncProvider) return;
       clearConnectTimeout();
@@ -158,10 +175,59 @@ export default function App() {
             }
           }, WS_SYNC_TIMEOUT_MS);
         }
-      } else if (e.status === "disconnected" && !wsSynced) {
+      } else if (e.status === "disconnected" && !wsSynced && wantConnect) {
         switchToHttp();
       }
     }
+
+    function clearIdle() {
+      if (idleTimer !== undefined) {
+        clearTimeout(idleTimer);
+        idleTimer = undefined;
+      }
+    }
+
+    function scheduleIdle() {
+      clearIdle();
+      idleTimer = window.setTimeout(() => {
+        idleTimer = undefined;
+        if (!cancelled && wantConnect && current) {
+          wantConnect = false;
+          current.disconnect();
+        }
+      }, IDLE_DISCONNECT_MS);
+    }
+
+    function reconnectIfNeeded() {
+      if (cancelled) return;
+      if (!wantConnect) {
+        wantConnect = true;
+        if (current) {
+          current.connect();
+          if (current instanceof WebsocketProvider) armConnectTimeout();
+        } else {
+          armConnectTimeout();
+        }
+      }
+      scheduleIdle();
+    }
+
+    const onActivity = () => {
+      const now = Date.now();
+      if (now - lastActivity < 1000) return;
+      lastActivity = now;
+      reconnectIfNeeded();
+    };
+
+    const onVisibility = () => {
+      if (document.hidden) {
+        wantConnect = false;
+        clearIdle();
+        if (current) current.disconnect();
+      } else {
+        reconnectIfNeeded();
+      }
+    };
 
     const p = new WebsocketProvider(syncServerUrl(), roomId, doc, {
       connect: false,
@@ -171,18 +237,23 @@ export default function App() {
     p.on("status", onWsStatus);
     p.on("sync", onWsSync);
     p.connect();
+    armConnectTimeout();
+    scheduleIdle();
 
-    connectTimeout = setTimeout(() => {
-      connectTimeout = undefined;
-      if (!cancelled && !wsEverConnected && current instanceof WebsocketProvider) {
-        switchToHttp();
-      }
-    }, WS_CONNECT_TIMEOUT_MS);
+    window.addEventListener("keydown", onActivity);
+    window.addEventListener("pointerdown", onActivity);
+    window.addEventListener("pointermove", onActivity, { passive: true });
+    document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
       cancelled = true;
       clearConnectTimeout();
       clearSyncTimeout();
+      clearIdle();
+      window.removeEventListener("keydown", onActivity);
+      window.removeEventListener("pointerdown", onActivity);
+      window.removeEventListener("pointermove", onActivity);
+      document.removeEventListener("visibilitychange", onVisibility);
       if (current) teardown(current, onWsStatus, onWsSync);
     };
   }, [roomId, doc, awareness]);
@@ -214,8 +285,6 @@ export default function App() {
     const onMeta = () => {
       const value = meta.get("language");
       if (value) setLanguage(value);
-      const nextMode = meta.get("mode");
-      if (nextMode === "text" || nextMode === "excel") setMode(nextMode);
     };
     const onText = () => setEmpty(ytext.length === 0);
     meta.observe(onMeta);
@@ -258,7 +327,6 @@ export default function App() {
   const toggleMode = () => {
     const next: EditorMode = mode === "text" ? "excel" : "text";
     setMode(next);
-    doc.getMap<string>("ypad").set("mode", next);
   };
 
   const currentLangLabel = languageLabel(language);
