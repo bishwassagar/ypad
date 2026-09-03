@@ -10,8 +10,8 @@ import type { Awareness } from "y-protocols/awareness";
 export const messageSync = 0;
 export const messageAwareness = 1;
 
-const FLUSH_INTERVAL_MS = 80;
-const MAX_BATCH_MESSAGES = 50;
+const FLUSH_INTERVAL_MS = 500;
+const MAX_BATCH_MESSAGES = 100;
 // Free-tier Durable Object duration is billed per second while an SSE stream
 // is held open, so background tabs must not keep one alive.
 const DEFAULT_MAX_BACKOFF_MS = 30_000;
@@ -26,9 +26,10 @@ export interface HttpSyncProviderEvents {
  * the network blocks WebSocket upgrades (SSE is a plain HTTP GET/POST and passes
  * through most proxies and captive portals).
  *
- * Outgoing frames are queued and flushed as one concatenated batch per ~80ms to
+ * Outgoing frames are queued and flushed as one concatenated batch per ~500ms to
  * keep request counts low; the server parses concatenated frames and replies in
  * kind. POSTs use a CORS-simple content type so browsers never preflight.
+ * Awareness (cursors) is not sent over HTTP to save requests - WS carries it.
  */
 export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
   serverUrl: string;
@@ -80,16 +81,7 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
         this.send(encoding.toUint8Array(encoder));
       }
     };
-    this._awarenessUpdateHandler = ({ added, updated, removed }) => {
-      const changedClients = added.concat(updated, removed);
-      const encoder = encoding.createEncoder();
-      encoding.writeVarUint(encoder, messageAwareness);
-      encoding.writeVarUint8Array(
-        encoder,
-        awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients)
-      );
-      this.send(encoding.toUint8Array(encoder));
-    };
+    this._awarenessUpdateHandler = () => {};
 
     this.doc.on("update", this._updateHandler);
     this.awareness.on("update", this._awarenessUpdateHandler);
@@ -193,16 +185,6 @@ export class HttpSyncProvider extends ObservableV2<HttpSyncProviderEvents> {
       encoding.writeVarUint(encoder, messageSync);
       syncProtocol.writeSyncStep1(encoder, this.doc);
       this.send(encoding.toUint8Array(encoder));
-
-      if (this.awareness.getLocalState() !== null) {
-        const aEncoder = encoding.createEncoder();
-        encoding.writeVarUint(aEncoder, messageAwareness);
-        encoding.writeVarUint8Array(
-          aEncoder,
-          awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID])
-        );
-        this.send(encoding.toUint8Array(aEncoder));
-      }
       void this.flush();
     };
 

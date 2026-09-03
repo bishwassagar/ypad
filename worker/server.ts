@@ -40,6 +40,14 @@ export default {
     const url = new URL(request.url);
     const room = decodeURIComponent(url.pathname.slice(1));
     if (!room) return new Response("YPad sync server", { status: 200 });
+    if (
+      room === "favicon.ico" ||
+      room === "favicon.svg" ||
+      room === "robots.txt" ||
+      /\.[a-z0-9]+$/i.test(room)
+    ) {
+      return new Response("Not found", { status: 404 });
+    }
 
     const id = env.YPAD_ROOM.idFromName(room);
     const stub = env.YPAD_ROOM.get(id);

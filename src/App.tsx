@@ -29,6 +29,7 @@ const WS_SYNC_TIMEOUT_MS = 10000;
 // Tear the DO connection down after this much local inactivity so the Durable
 // Object can hibernate; wall-clock duration is the free-tier constraint.
 const IDLE_DISCONNECT_MS = 90_000;
+const HTTP_IDLE_DISCONNECT_MS = 30_000;
 
 type EditorMode = "text" | "excel";
 
@@ -189,13 +190,17 @@ export default function App() {
 
     function scheduleIdle() {
       clearIdle();
+      const delay =
+        current instanceof HttpSyncProvider
+          ? HTTP_IDLE_DISCONNECT_MS
+          : IDLE_DISCONNECT_MS;
       idleTimer = window.setTimeout(() => {
         idleTimer = undefined;
         if (!cancelled && wantConnect && current) {
           wantConnect = false;
           current.disconnect();
         }
-      }, IDLE_DISCONNECT_MS);
+      }, delay);
     }
 
     function reconnectIfNeeded() {
