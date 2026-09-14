@@ -3,7 +3,7 @@ import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { Awareness } from "y-protocols/awareness";
 import { HttpSyncProvider } from "./sync/httpProvider";
-import { Languages, Moon, Share2, Sun, Table2 } from "lucide-react";
+import { FileText, Languages, Moon, Share2, Sun, Table2 } from "lucide-react";
 import { Editor } from "./editor";
 import { Sheet } from "./Sheet";
 import { ShareModal } from "./share";
@@ -329,11 +329,6 @@ export default function App() {
     doc.getMap<string>("ypad").set("language", id);
   };
 
-  const toggleMode = () => {
-    const next: EditorMode = mode === "text" ? "excel" : "text";
-    setMode(next);
-  };
-
   const currentLangLabel = languageLabel(language);
 
   return (
@@ -353,17 +348,40 @@ export default function App() {
 
         <StatusDot status={status} />
 
-        <ToolbarButton
-          onClick={toggleMode}
-          title={mode === "excel" ? "Switch to text mode" : "Switch to excel mode"}
-          className={
-            mode === "excel"
-              ? "bg-neutral-200 text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100"
-              : ""
-          }
+        <div
+          role="group"
+          aria-label="Editor mode"
+          className="flex h-8 items-center rounded-md border border-neutral-200 bg-neutral-100 p-0.5 dark:border-neutral-800 dark:bg-neutral-900"
         >
-          <Table2 size={16} />
-        </ToolbarButton>
+          <button
+            type="button"
+            onClick={() => setMode("text")}
+            aria-pressed={mode === "text"}
+            title="Text mode"
+            className={`flex h-full items-center gap-1.5 rounded px-2 text-xs font-medium ${
+              mode === "text"
+                ? "bg-white text-neutral-900 shadow-sm dark:bg-neutral-800 dark:text-neutral-100"
+                : "text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100"
+            }`}
+          >
+            <FileText size={14} />
+            <span className="hidden sm:inline">Text</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("excel")}
+            aria-pressed={mode === "excel"}
+            title="Table mode"
+            className={`flex h-full items-center gap-1.5 rounded px-2 text-xs font-medium ${
+              mode === "excel"
+                ? "bg-white text-neutral-900 shadow-sm dark:bg-neutral-800 dark:text-neutral-100"
+                : "text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100"
+            }`}
+          >
+            <Table2 size={14} />
+            <span className="hidden sm:inline">Table</span>
+          </button>
+        </div>
 
         <Dropdown
           align="right"

@@ -53,6 +53,8 @@ export function ContextMenu({ x, y, rect, commands, onClose }: ContextMenuProps)
   const cols = rect.c1 - rect.c0 + 1;
   const rowLabel = rows > 1 ? `${rows} rows` : "row";
   const colLabel = cols > 1 ? `${cols} columns` : "column";
+  const rowRange =
+    rows > 1 ? `rows ${rect.r0 + 1}–${rect.r1 + 1}` : `row ${rect.r0 + 1}`;
   const run = (fn: () => void) => () => {
     fn();
     onClose();
@@ -109,6 +111,9 @@ export function ContextMenu({ x, y, rect, commands, onClose }: ContextMenuProps)
         onClick={run(() => commands.clearSelection(rect))}
       >
         <Eraser size={14} /> Clear contents
+        <kbd className="ml-auto rounded border border-neutral-200 px-1 text-[11px] text-neutral-400 dark:border-neutral-700">
+          Del
+        </kbd>
       </button>
       <div className={sep} />
       <button
@@ -129,11 +134,11 @@ export function ContextMenu({ x, y, rect, commands, onClose }: ContextMenuProps)
       </button>
       <button
         type="button"
-        className={item}
+        className={`${item} text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40`}
         onMouseDown={(e) => e.preventDefault()}
         onClick={run(() => commands.deleteSelectedRows(rect))}
       >
-        <Trash2 size={14} /> Delete {rowLabel}
+        <Trash2 size={14} /> Delete {rowRange}
       </button>
       <div className={sep} />
       <button
@@ -154,7 +159,7 @@ export function ContextMenu({ x, y, rect, commands, onClose }: ContextMenuProps)
       </button>
       <button
         type="button"
-        className={item}
+        className={`${item} text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40`}
         onMouseDown={(e) => e.preventDefault()}
         onClick={run(() => commands.deleteSelectedCols(rect))}
       >
