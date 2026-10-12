@@ -13,7 +13,7 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   ReactNode,
-  RefObject,
+  Ref,
 } from "react";
 import * as Y from "yjs";
 import { ChevronDown, ChevronUp } from "lucide-react";
@@ -168,7 +168,7 @@ interface SheetRowProps {
   editing: boolean;
   draft: string;
   autoFocusEditor: boolean;
-  inputRef: RefObject<HTMLTextAreaElement | null>;
+  inputRef: Ref<HTMLTextAreaElement | null>;
   onDraftChange: (v: string) => void;
   onInputKeyDown: (
     e: ReactKeyboardEvent<HTMLTextAreaElement>
@@ -349,6 +349,33 @@ export function Sheet({ doc }: { doc: Y.Doc }) {
   const draftRef = useRef("");
   const composingRef = useRef(false);
   const scrollRafRef = useRef(0);
+  const focusCellRef = useRef(editFocusCell);
+  focusCellRef.current = editFocusCell;
+  // The editor mounts with the seed draft (e.g. the first typed char), but
+  // autofocus leaves the caret at offset 0, so follow-up keystrokes insert
+  // before it ("Q"+"uery" -> "ueryQ"). Placing the caret at the end on mount
+  // only fixes this without disturbing mid-edit cursor moves. Bar-originated
+  // edits (focusCell false) never steal focus.
+  const editorRef = useCallback((el: HTMLTextAreaElement | null) => {
+    inputRef.current = el;
+    if (el && focusCellRef.current) {
+      requestAnimationFrame(() => {
+        if (document.activeElement !== el) {
+          try {
+            el.focus({ preventScroll: true });
+          } catch {
+            el.focus();
+          }
+        }
+        try {
+          const len = el.value.length;
+          el.setSelectionRange(len, len);
+        } catch {
+          // setSelectionRange can throw on hidden inputs; ignore.
+        }
+      });
+    }
+  }, []);
 
   const longestRow = useMemo(
     () => cells.reduce((n, row) => Math.max(n, row.length), 0),
@@ -1284,7 +1311,7 @@ export function Sheet({ doc }: { doc: Y.Doc }) {
         editing={editing && sel.r === r}
         draft={draft}
         autoFocusEditor={editFocusCell}
-        inputRef={inputRef}
+        inputRef={editorRef}
         onDraftChange={setDraftBoth}
         onInputKeyDown={onInputKeyDown}
         onInputBlur={commitEdit}
