@@ -3,7 +3,29 @@ import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { Awareness } from "y-protocols/awareness";
 import { HttpSyncProvider } from "./sync/httpProvider";
-import { FileText, Languages, Moon, Share2, Sun, Table2 } from "lucide-react";
+import { EncHttpSyncProvider } from "./sync/encHttpProvider";
+import {
+  base64ToBytes,
+  checkVerifier,
+  decryptFrame,
+  deriveRoomKey,
+  encryptFrame,
+  exportRoomKey,
+  importRoomKey,
+  meetsMinLength,
+  sessionKeyName,
+  verifierPlaintext,
+} from "./crypto";
+import {
+  FileText,
+  Languages,
+  Lock,
+  LockOpen,
+  Moon,
+  Share2,
+  Sun,
+  Table2,
+} from "lucide-react";
 import { Editor } from "./editor";
 import { Sheet } from "./Sheet";
 import { ShareModal } from "./share";
@@ -67,6 +89,139 @@ interface SyncProviderLike {
   destroy(): void;
 }
 
+interface RoomStatus {
+  mode: "plain" | "enc";
+  hasData: boolean;
+  verifier?: string;
+}
+
+async function fetchRoomStatus(roomId: string): Promise<RoomStatus> {
+  const res = await fetch(
+    `${httpSyncServerUrl()}/${encodeURIComponent(roomId)}?status=1`,
+  );
+  if (!res.ok) return { mode: "plain", hasData: false };
+  const body = (await res.json()) as RoomStatus;
+  return body.mode === "enc"
+    ? { mode: "enc", hasData: body.hasData, verifier: body.verifier }
+    : { mode: "plain", hasData: body.hasData };
+}
+
+type LockKind = "checking" | "setup" | "plain" | "locked" | "unlocked";
+
+function PasswordModal({
+  title,
+  subtitle,
+  confirm,
+  error,
+  busy,
+  onSubmit,
+  onCancel,
+  cancelLabel,
+  extra,
+}: {
+  title: string;
+  subtitle: string;
+  confirm: boolean;
+  error: string | null;
+  busy: boolean;
+  onSubmit: (password: string) => void;
+  onCancel: (() => void) | null;
+  cancelLabel: string;
+  extra?: React.ReactNode;
+}) {
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [mismatch, setMismatch] = useState(false);
+  const tooShort = confirm && pw.length > 0 && !meetsMinLength(pw);
+
+  const submit = () => {
+    if (confirm) {
+      if (pw !== pw2) {
+        setMismatch(true);
+        return;
+      }
+      if (!meetsMinLength(pw)) return;
+    }
+    if (!pw) return;
+    onSubmit(pw);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-5 shadow-xl dark:border-neutral-800 dark:bg-neutral-900">
+        <div className="mb-1 flex items-center gap-2 text-sm font-medium text-neutral-900 dark:text-neutral-100">
+          <Lock size={16} />
+          {title}
+        </div>
+        <p className="mb-4 text-xs text-neutral-500 dark:text-neutral-400">
+          {subtitle}
+        </p>
+        <input
+          autoFocus
+          type="password"
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") submit();
+          }}
+          placeholder={confirm ? "Choose a password" : "Pad password"}
+          className="mb-2 w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
+        />
+        {confirm && (
+          <>
+            <input
+              type="password"
+              value={pw2}
+              onChange={(e) => {
+                setPw2(e.target.value);
+                setMismatch(false);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submit();
+              }}
+              placeholder="Confirm password"
+              className="mb-2 w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
+            />
+            <p className="mb-2 text-xs text-neutral-500 dark:text-neutral-400">
+              {tooShort
+                ? "Use at least 8 characters."
+                : "The password never leaves your device."}
+            </p>
+          </>
+        )}
+        {mismatch && (
+          <p className="mb-2 text-xs text-red-600 dark:text-red-400">
+            Passwords don&apos;t match.
+          </p>
+        )}
+        {error && (
+          <p className="mb-2 text-xs text-red-600 dark:text-red-400">{error}</p>
+        )}
+        {extra}
+        <div className="mt-3 flex gap-2">
+          <button
+            type="button"
+            disabled={busy || !pw || (confirm && !meetsMinLength(pw))}
+            onClick={submit}
+            className="flex-1 rounded-md bg-neutral-900 px-3 py-2 text-xs font-medium text-white hover:bg-neutral-700 disabled:opacity-50 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white"
+          >
+            {busy ? "Working…" : confirm ? "Set password" : "Unlock"}
+          </button>
+          {onCancel && (
+            <button
+              type="button"
+              onClick={onCancel}
+              className="flex-1 rounded-md border border-neutral-300 px-3 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            >
+              {cancelLabel}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [roomId] = useState(roomIdFromHash);
   const [doc] = useState(() => new Y.Doc());
@@ -82,12 +237,154 @@ export default function App() {
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(user.name);
   const userRef = useRef(user);
+  const [lock, setLock] = useState<LockKind>("checking");
+  const [status2, setStatus2] = useState<RoomStatus | null>(null);
+  const [encKey, setEncKey] = useState<CryptoKey | null>(null);
+  const [pwError, setPwError] = useState<string | null>(null);
+  const [pwBusy, setPwBusy] = useState(false);
+  const [showAddPw, setShowAddPw] = useState(false);
+  const encKeyRef = useRef<CryptoKey | null>(null);
+  encKeyRef.current = encKey;
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark);
   }, [dark]);
 
   useEffect(() => {
+    let cancelled = false;
+    setLock("checking");
+    setStatus2(null);
+    setEncKey(null);
+    setPwError(null);
+    setShowAddPw(false);
+    void fetchRoomStatus(roomId)
+      .then(async (st) => {
+        if (cancelled) return;
+        setStatus2(st);
+        if (st.mode === "enc" && st.verifier) {
+          const cached = sessionStorage.getItem(sessionKeyName(roomId));
+          if (cached) {
+            try {
+              const key = await importRoomKey(cached);
+              const plain = await decryptFrame(key, base64ToBytes(st.verifier));
+              if (checkVerifier(plain, roomId)) {
+                setEncKey(key);
+                setLock("unlocked");
+                return;
+              }
+            } catch {
+              // fall through to password prompt
+            }
+            sessionStorage.removeItem(sessionKeyName(roomId));
+          }
+          setLock("locked");
+        } else if (!st.hasData) {
+          setLock("setup");
+        } else {
+          setLock("plain");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setStatus2({ mode: "plain", hasData: false });
+          setLock("plain");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [roomId]);
+
+  async function cacheKey(key: CryptoKey) {
+    try {
+      sessionStorage.setItem(sessionKeyName(roomId), await exportRoomKey(key));
+    } catch {
+      // private mode / quota: memory-only is fine
+    }
+  }
+
+  async function setupPassword(password: string, takeover: boolean) {
+    setPwBusy(true);
+    setPwError(null);
+    try {
+      const key = await deriveRoomKey(password, roomId);
+      const verifier = await encryptFrame(key, verifierPlaintext(roomId));
+      const res = await fetch(
+        `${httpSyncServerUrl()}/${encodeURIComponent(roomId)}?initEnc=1${takeover ? "&takeover=1" : ""}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=UTF-8" },
+          body: new Blob([verifier as BlobPart]),
+        },
+      );
+      if (res.status === 409) {
+        const body = (await res.json()) as { error?: string };
+        if (body.error === "already-encrypted") {
+          const st = await fetchRoomStatus(roomId);
+          setStatus2(st);
+          setLock("locked");
+          setPwError("Someone just set a password — enter it to unlock.");
+        } else {
+          setPwError("This pad already has content on the server.");
+        }
+        return;
+      }
+      if (!res.ok) {
+        setPwError("Couldn't reach the server. Try again.");
+        return;
+      }
+      await cacheKey(key);
+      setEncKey(key);
+      setStatus2({ mode: "enc", hasData: false });
+      setLock("unlocked");
+      setShowAddPw(false);
+    } finally {
+      setPwBusy(false);
+    }
+  }
+
+  async function unlockPassword(password: string) {
+    const st = status2;
+    if (!st || st.mode !== "enc" || !st.verifier) return;
+    setPwBusy(true);
+    setPwError(null);
+    try {
+      const key = await deriveRoomKey(password, roomId);
+      let plain: Uint8Array;
+      try {
+        plain = await decryptFrame(key, base64ToBytes(st.verifier));
+      } catch {
+        setPwError("Wrong password. Try again.");
+        return;
+      }
+      if (!checkVerifier(plain, roomId)) {
+        setPwError("Wrong password. Try again.");
+        return;
+      }
+      await cacheKey(key);
+      setEncKey(key);
+      setLock("unlocked");
+    } finally {
+      setPwBusy(false);
+    }
+  }
+
+  function forgetKey() {
+    sessionStorage.removeItem(sessionKeyName(roomId));
+    setEncKey(null);
+    setLock("locked");
+  }
+
+  function newPad() {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    const fresh = Array.from(bytes, (b) => CHARS[b % CHARS.length]).join("");
+    window.location.hash = `#${fresh}`;
+    window.location.reload();
+  }
+
+  useEffect(() => {
+    if (lock !== "plain") return;
     let current: WebsocketProvider | HttpSyncProvider | null = null;
     let wsEverConnected = false;
     let wsSynced = false;
@@ -261,7 +558,38 @@ export default function App() {
       document.removeEventListener("visibilitychange", onVisibility);
       if (current) teardown(current, onWsStatus, onWsSync);
     };
-  }, [roomId, doc, awareness]);
+  }, [roomId, doc, awareness, lock]);
+
+  useEffect(() => {
+    if (lock !== "unlocked" || !encKey) return;
+    let cancelled = false;
+    const p = new EncHttpSyncProvider(httpSyncServerUrl(), roomId, doc, encKey, {
+      awareness,
+    });
+    const onStatus = (e: { status: string }) => {
+      if (
+        e.status === "connecting" ||
+        e.status === "connected" ||
+        e.status === "disconnected"
+      ) {
+        setStatus(e.status as ConnectionStatus);
+      }
+    };
+    p.on("status", onStatus);
+    p.connect();
+    // If this client already holds content (password takeover on a plaintext
+    // room), upload it as ciphertext so history survives the mode switch.
+    const t = window.setTimeout(() => {
+      if (!cancelled) p.pushSnapshot();
+    }, 1500);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+      p.off("status", onStatus);
+      p.disconnect();
+      p.destroy();
+    };
+  }, [roomId, doc, awareness, lock, encKey]);
 
   useEffect(() => {
     awareness.setLocalStateField("user", userRef.current);
@@ -348,6 +676,25 @@ export default function App() {
 
         <StatusDot status={status} />
 
+        {lock === "unlocked" && (
+          <span
+            title="End-to-end encrypted: the server only holds ciphertext. Anyone opening this link needs the password."
+            className="hidden items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-600 sm:flex dark:text-emerald-400"
+          >
+            <Lock size={12} />
+            Encrypted
+          </span>
+        )}
+        {lock === "plain" && (
+          <span
+            title="Not encrypted: the server operator can read this pad. Don't paste secrets."
+            className="hidden items-center gap-1 rounded-md bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-600 sm:flex dark:text-amber-400"
+          >
+            <LockOpen size={12} />
+            Not encrypted
+          </span>
+        )}
+
         <div
           role="group"
           aria-label="Editor mode"
@@ -427,6 +774,23 @@ export default function App() {
           <Share2 size={16} />
         </ToolbarButton>
 
+        {lock === "unlocked" && (
+          <ToolbarButton onClick={forgetKey} title="Lock pad (forget password)">
+            <Lock size={16} />
+          </ToolbarButton>
+        )}
+        {lock === "plain" && status2?.hasData && (
+          <ToolbarButton
+            onClick={() => {
+              setPwError(null);
+              setShowAddPw(true);
+            }}
+            title="Protect with password"
+          >
+            <Lock size={16} />
+          </ToolbarButton>
+        )}
+
         <AvatarCluster peers={peers} />
 
         <div className="flex items-center">
@@ -473,7 +837,58 @@ export default function App() {
         )}
       </main>
 
-      <ShareModal open={shareOpen} onClose={() => setShareOpen(false)} />
+      <ShareModal
+        open={shareOpen}
+        onClose={() => setShareOpen(false)}
+        encrypted={lock === "unlocked"}
+      />
+
+      {lock === "checking" && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-white dark:bg-neutral-950">
+          <p className="text-sm text-neutral-500 dark:text-neutral-400">
+            Checking pad…
+          </p>
+        </div>
+      )}
+
+      {lock === "setup" && (
+        <PasswordModal
+          title="Protect this pad?"
+          subtitle="Set a password to encrypt it end-to-end — the server will only hold ciphertext. Anyone opening the link needs the password."
+          confirm
+          error={pwError}
+          busy={pwBusy}
+          onSubmit={(pw) => void setupPassword(pw, false)}
+          onCancel={() => setLock("plain")}
+          cancelLabel="Skip (not encrypted)"
+        />
+      )}
+
+      {lock === "locked" && (
+        <PasswordModal
+          title="This pad is encrypted"
+          subtitle="Enter the password to decrypt it. The password never leaves your device."
+          confirm={false}
+          error={pwError}
+          busy={pwBusy}
+          onSubmit={(pw) => void unlockPassword(pw)}
+          onCancel={newPad}
+          cancelLabel="New pad instead"
+        />
+      )}
+
+      {showAddPw && lock === "plain" && (
+        <PasswordModal
+          title="Protect this pad?"
+          subtitle="Anything already on the server was readable before this. Setting a password encrypts everything from now on — tell others to reload and enter it."
+          confirm
+          error={pwError}
+          busy={pwBusy}
+          onSubmit={(pw) => void setupPassword(pw, true)}
+          onCancel={() => setShowAddPw(false)}
+          cancelLabel="Cancel"
+        />
+      )}
     </div>
   );
 }

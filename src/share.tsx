@@ -4,9 +4,10 @@ import { Check, Copy, Share2, X } from "lucide-react";
 interface ShareModalProps {
   open: boolean;
   onClose: () => void;
+  encrypted?: boolean;
 }
 
-export function ShareModal({ open, onClose }: ShareModalProps) {
+export function ShareModal({ open, onClose, encrypted }: ShareModalProps) {
   const [copied, setCopied] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -61,7 +62,9 @@ export function ShareModal({ open, onClose }: ShareModalProps) {
           </button>
         </div>
         <p className="mb-3 text-xs text-neutral-500 dark:text-neutral-400">
-          Anyone with this link can view and edit the pad in real time.
+          {encrypted
+            ? "Anyone with this link still needs the password. Share the link and the password through different channels."
+            : "Anyone with this link can view and edit the pad in real time. This pad is not encrypted — the server operator can read it, so don't share secrets here."}
         </p>
         <div className="flex gap-2">
           <input

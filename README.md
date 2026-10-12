@@ -28,6 +28,10 @@ Cloudflare account and static host in minutes (see [Deploy](#deploy)).
 - Cloud persistence — pads survive all clients disconnecting
 - Share link with copy-to-clipboard
 - No auth: anyone with the link can edit (same as Rustpad)
+- **Password-protected pads (E2E)** — set a password and content is
+  AES-GCM encrypted in the browser before it leaves your device; the server
+  only relays/stores ciphertext. See [PRIVACY.md](./PRIVACY.md). Pads without
+  a password are plaintext on the server — don't paste secrets there.
 - **Collaborative spreadsheet mode** — toggle the top bar to a CRDT-backed grid
   (`src/sheet.ts` / `src/Sheet.tsx`) with row/column insert/delete, range
   copy/cut/clear, and TSV paste. View mode is local; language stays shared.

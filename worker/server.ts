@@ -21,6 +21,12 @@ function toBase64(bytes: Uint8Array): string {
 }
 
 const STATE_KEY = "state";
+const MODE_KEY = "mode";
+const ENC_LOG_KEY = "enc-log";
+const ENC_VERIFIER_KEY = "enc-verifier";
+// Cap for the opaque ciphertext log per encrypted room. Keeps free-tier
+// storage bounded; clients compact by uploading a snapshot that supersedes it.
+const ENC_LOG_CAP_BYTES = 2 * 1024 * 1024;
 const PERSIST_DEBOUNCE_MS = 500;
 // Browser-facing SSE keepalive. Runs inside the plain front Worker, which has
 // no duration dimension — cadence only needs to survive middlebox idle timeouts.
@@ -28,7 +34,7 @@ const SSE_KEEPALIVE_MS = 15_000;
 // Relay->DO liveness. Answered at the edge by setWebSocketAutoResponse, so it
 // never wakes or bills the DO.
 const DO_LEG_PING_MS = 60_000;
-const ROOM_TTL_MS = 48 * 60 * 60 * 1000;
+const ROOM_TTL_MS = 24 * 60 * 60 * 1000;
 
 interface Env {
   YPAD_ROOM: DurableObjectNamespace<YpadRoom>;
@@ -150,6 +156,13 @@ export class YpadRoom extends DurableObject<Env> {
   private deleted = false;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private ttlMs: number;
+  // Password-E2E state. Encrypted rooms never instantiate a server-side Y.Doc
+  // view of the content: the DO is an opaque ciphertext relay (append +
+  // broadcast + replay) so the operator only ever holds ciphertext.
+  private mode: "plain" | "enc" = "plain";
+  private encLog: Uint8Array[] = [];
+  private encLogBytes = 0;
+  private encVerifier: Uint8Array | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -225,6 +238,39 @@ export class YpadRoom extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
+  // Encrypted POST bodies are length-prefixed frames:
+  //   [u32be len][frame]...  (each frame is one AES-GCM envelope)
+  private splitEncPacked(data: Uint8Array): Uint8Array[] {
+    const frames: Uint8Array[] = [];
+    let off = 0;
+    while (off + 4 <= data.length) {
+      const len =
+        ((data[off] << 24) |
+          (data[off + 1] << 16) |
+          (data[off + 2] << 8) |
+          data[off + 3]) >>>
+        0;
+      if (len === 0 || len > ENC_LOG_CAP_BYTES || off + 4 + len > data.length) {
+        break;
+      }
+      frames.push(data.subarray(off + 4, off + 4 + len));
+      off += 4 + len;
+    }
+    return frames;
+  }
+
+  private appendEncFrame(frame: Uint8Array): boolean {
+    if (frame.length === 0 || frame.length > ENC_LOG_CAP_BYTES) return false;
+    // Envelopes start with the version byte; anything else is a plaintext
+    // peer that hasn't reloaded since a password takeover — drop it rather
+    // than polluting the ciphertext log.
+    if (frame[0] !== 0xe1) return false;
+    if (this.encLogBytes + frame.length > ENC_LOG_CAP_BYTES) return false;
+    this.encLog.push(frame.slice());
+    this.encLogBytes += frame.length;
+    return true;
+  }
+
   private async handleHttp(request: Request): Promise<Response> {
     const cors = { "Access-Control-Allow-Origin": "*" };
     if (request.method === "OPTIONS") {
@@ -238,9 +284,62 @@ export class YpadRoom extends DurableObject<Env> {
         },
       });
     }
+    const reqUrl = new URL(request.url);
+    if (request.method === "GET" && reqUrl.searchParams.get("status") === "1") {
+      const body: { mode: string; hasData: boolean; verifier?: string } = {
+        mode: this.mode,
+        hasData:
+          this.mode === "enc"
+            ? this.encLog.length > 0
+            : this.doc.getText("content").length > 0 ||
+              (this.doc.getMap("ypad").size ?? 0) > 0,
+      };
+      if (this.mode === "enc" && this.encVerifier) {
+        body.verifier = toBase64(this.encVerifier);
+      }
+      return new Response(JSON.stringify(body), {
+        headers: { "Content-Type": "application/json", ...cors },
+      });
+    }
     if (request.method === "POST") {
-      const reqUrl = new URL(request.url);
       const token = reqUrl.searchParams.get("token");
+      // Claim an empty (or taken-over) room as password-encrypted. The body is
+      // the AES-GCM verifier envelope; the password never leaves the browser.
+      if (reqUrl.searchParams.get("initEnc") === "1") {
+        if (this.mode === "enc") {
+          return new Response(JSON.stringify({ error: "already-encrypted" }), {
+            status: 409,
+            headers: { "Content-Type": "application/json", ...cors },
+          });
+        }
+        const takeover = reqUrl.searchParams.get("takeover") === "1";
+        const plainHasData =
+          this.doc.getText("content").length > 0 ||
+          (this.doc.getMap("ypad").size ?? 0) > 0;
+        if (plainHasData && !takeover) {
+          return new Response(JSON.stringify({ error: "has-plaintext" }), {
+            status: 409,
+            headers: { "Content-Type": "application/json", ...cors },
+          });
+        }
+        const verifier = new Uint8Array(await request.arrayBuffer());
+        if (verifier.length === 0) {
+          return new Response("missing verifier", { status: 400 });
+        }
+        this.mode = "enc";
+        this.encVerifier = verifier.slice();
+        this.encLog = [];
+        this.encLogBytes = 0;
+        this.initDoc();
+        await this.ctx.storage.put(MODE_KEY, "enc");
+        await this.ctx.storage.put(ENC_VERIFIER_KEY, this.encVerifier);
+        await this.ctx.storage.put(ENC_LOG_KEY, new Uint8Array(0));
+        await this.ctx.storage.deleteAlarm();
+        this.deleted = false;
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "Content-Type": "application/json", ...cors },
+        });
+      }
       // Explicit goodbye from the client; closing the socket routes through
       // webSocketClose for cleanup and TTL arming.
       if (reqUrl.searchParams.get("close") === "1" && token) {
@@ -249,6 +348,23 @@ export class YpadRoom extends DurableObject<Env> {
         return new Response(null, { headers: cors });
       }
       const body = new Uint8Array(await request.arrayBuffer());
+      if (this.mode === "enc") {
+        // Opaque relay: store + broadcast, reply empty. History reaches late
+        // joiners through the SSE burst / WS initial state, not POST replies.
+        if (body.length > 0) {
+          let stored = false;
+          for (const frame of this.splitEncPacked(body)) {
+            if (this.appendEncFrame(frame)) {
+              stored = true;
+              this.broadcast(frame);
+            }
+          }
+          if (stored) this.schedulePersist();
+        }
+        return new Response(null, {
+          headers: { "Content-Type": "application/octet-stream", ...cors },
+        });
+      }
       let reply: Uint8Array | null = null;
       if (body.length > 0) {
         const client = token ? (this.ctx.getWebSockets(token)[0] ?? null) : null;
@@ -263,6 +379,14 @@ export class YpadRoom extends DurableObject<Env> {
 
   private sendInitialState(client: WebSocket): void {
     try {
+      if (this.mode === "enc") {
+        // Late joiners catch up by replaying the ciphertext log; decryption
+        // and Yjs application happen client-side after password unlock.
+        for (const frame of this.encLog) {
+          client.send(frame);
+        }
+        return;
+      }
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, messageSync);
       syncProtocol.writeSyncStep1(encoder, this.doc);
@@ -283,7 +407,21 @@ export class YpadRoom extends DurableObject<Env> {
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string) {
     if (typeof message === "string") return; // relay liveness frames are auto-answered
-    const reply = this.handleMessage(ws, new Uint8Array(message));
+    const bytes = new Uint8Array(message);
+    if (this.mode === "enc") {
+      // One WS message = one AES-GCM envelope. Relay opaquely, never parse.
+      if (bytes.length > 0 && this.appendEncFrame(bytes)) {
+        for (const other of this.ctx.getWebSockets()) {
+          if (other === ws) continue;
+          try {
+            other.send(bytes);
+          } catch {}
+        }
+        this.schedulePersist();
+      }
+      return;
+    }
+    const reply = this.handleMessage(ws, bytes);
     if (reply) {
       try {
         ws.send(reply);
@@ -394,13 +532,44 @@ export class YpadRoom extends DurableObject<Env> {
     this.deleted = true;
     await this.ctx.storage.deleteAll();
     await this.ctx.storage.deleteAlarm();
+    this.mode = "plain";
+    this.encLog = [];
+    this.encLogBytes = 0;
+    this.encVerifier = null;
     this.initDoc();
     this.loaded = true;
+  }
+
+  private packEncLog(): Uint8Array {
+    let total = 0;
+    for (const f of this.encLog) total += 4 + f.length;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const f of this.encLog) {
+      out[off] = (f.length >>> 24) & 0xff;
+      out[off + 1] = (f.length >>> 16) & 0xff;
+      out[off + 2] = (f.length >>> 8) & 0xff;
+      out[off + 3] = f.length & 0xff;
+      out.set(f, off + 4);
+      off += 4 + f.length;
+    }
+    return out;
   }
 
   private async ensureLoaded() {
     if (this.loaded) return;
     this.loaded = true;
+    const mode = await this.ctx.storage.get<string>(MODE_KEY);
+    if (mode === "enc") {
+      this.mode = "enc";
+      this.encVerifier =
+        (await this.ctx.storage.get<Uint8Array>(ENC_VERIFIER_KEY)) ?? null;
+      const packed = await this.ctx.storage.get<Uint8Array>(ENC_LOG_KEY);
+      this.encLog = packed ? this.splitEncPacked(packed) : [];
+      this.encLogBytes = this.encLog.reduce((n, f) => n + f.length, 0);
+      this.initDoc();
+      return;
+    }
     const state = await this.ctx.storage.get<Uint8Array>(STATE_KEY);
     if (state) Y.applyUpdate(this.doc, state);
   }
@@ -416,6 +585,13 @@ export class YpadRoom extends DurableObject<Env> {
 
   private async persist() {
     if (this.deleted) return;
+    if (this.mode === "enc") {
+      if (this.encVerifier) {
+        await this.ctx.storage.put(ENC_VERIFIER_KEY, this.encVerifier);
+      }
+      await this.ctx.storage.put(ENC_LOG_KEY, this.packEncLog());
+      return;
+    }
     await this.ctx.storage.put(STATE_KEY, Y.encodeStateAsUpdate(this.doc));
   }
 }
