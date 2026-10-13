@@ -11,9 +11,12 @@ const messageQueryAwareness = 3;
 
 // workerd shims `process` (so lib0's buffer picks the Node base64 path) but
 // omits Buffer, so implement base64 with the standard Web APIs instead.
+// Small spread chunks: the relay encodes every broadcast message, and
+// materializing tens of thousands of args per call is the per-message CPU
+// hotspot under bursts (and risks stack overflow on large frames).
 function toBase64(bytes: Uint8Array): string {
   let binary = "";
-  const chunk = 0x8000;
+  const chunk = 0x1000;
   for (let i = 0; i < bytes.length; i += chunk) {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   }
@@ -88,11 +91,25 @@ async function relaySse(
   let open = true;
   let ping: ReturnType<typeof setInterval>;
   let doPing: ReturnType<typeof setInterval>;
+  // Back-to-back plain-protocol broadcasts coalesce into one SSE write (see
+  // the socket message handler). Caps bound worst-case encode size during
+  // bulk syncs.
+  const BATCH_CAP_BYTES = 128 * 1024;
+  const BATCH_CAP_MSGS = 1000;
+  let pending: Uint8Array[] = [];
+  let pendingBytes = 0;
+  let batchTimer: ReturnType<typeof setTimeout> | undefined;
 
   const stop = () => {
     open = false;
     clearInterval(ping);
     clearInterval(doPing);
+    if (batchTimer !== undefined) {
+      clearTimeout(batchTimer);
+      batchTimer = undefined;
+    }
+    pending = [];
+    pendingBytes = 0;
   };
 
   const write = async (chunk: string) => {
@@ -106,10 +123,55 @@ async function relaySse(
     }
   };
 
+  // Each DO broadcast arrives as its own socket message, but encode and
+  // stream writes have fixed per-call cost that dominates for small messages
+  // (awareness storms), so a turn's worth of plain-protocol frames goes out
+  // as one base64 + write. The client parses concatenated typed messages
+  // already, and the single writer keeps everything FIFO. Encrypted envelopes
+  // (0xe1…) must decrypt one-per-line client-side, so they always go solo.
+  const flushBatch = () => {
+    batchTimer = undefined;
+    const batch = pending;
+    const total = pendingBytes;
+    pending = [];
+    pendingBytes = 0;
+    if (batch.length === 0) return;
+    let body: Uint8Array;
+    if (batch.length === 1) {
+      body = batch[0];
+    } else {
+      body = new Uint8Array(total);
+      let off = 0;
+      for (const m of batch) {
+        body.set(m, off);
+        off += m.length;
+      }
+    }
+    void write(`data: ${toBase64(body)}\n\n`);
+  };
+
   ws.addEventListener("message", (e) => {
     if (!open) return;
     if (typeof e.data === "string") return; // "pong" from the auto-response leg
-    void write(`data: ${toBase64(new Uint8Array(e.data))}\n\n`);
+    const bytes = new Uint8Array(e.data);
+    const t = bytes.length > 0 ? bytes[0] : 0;
+    if (
+      (t === messageSync ||
+        t === messageAwareness ||
+        t === messageQueryAwareness) &&
+      pending.length < BATCH_CAP_MSGS &&
+      pendingBytes + bytes.length <= BATCH_CAP_BYTES
+    ) {
+      pending.push(bytes);
+      pendingBytes += bytes.length;
+      if (batchTimer === undefined) batchTimer = setTimeout(flushBatch, 0);
+      return;
+    }
+    if (batchTimer !== undefined) {
+      clearTimeout(batchTimer);
+      flushBatch();
+    }
+    void write(`data: ${toBase64(bytes)}\n\n`);
   });
 
   ws.addEventListener("close", () => {
@@ -135,7 +197,8 @@ async function relaySse(
   // Writes must not be awaited before the Response exists — nothing is reading
   // the stream yet, and workerd holds the write until it is. The single writer
   // keeps chunks ordered once streaming starts.
-  void write("retry: 5000\n\n");
+  // Jittered per stream so a mass kill doesn't reconnect in lockstep.
+  void write(`retry: ${5000 + Math.floor(Math.random() * 5000)}\n\n`);
 
   return new Response(readable, {
     headers: {
