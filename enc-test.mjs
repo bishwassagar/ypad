@@ -245,4 +245,166 @@ const roomB = `enc-b-${Date.now()}`;
   check("room B now enc, log empty", st2.body.mode === "enc" && st2.body.hasData === false, JSON.stringify(st2.body));
 }
 
+// --- SSE reader that parses named events and stops at burst-end ---
+async function readSseBurst(room, { ms = 8000, token = "t" } = {}) {
+  const res = await fetch(`${BASE}/${room}?transport=http&token=${token}`, {
+    headers: { Accept: "text/event-stream" },
+  });
+  const updates = [];
+  let end = null;
+  if (res.status !== 200) return { updates, end };
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  const deadline = Date.now() + ms;
+  outer: while (Date.now() < deadline) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const block = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      let eventName = "message";
+      let data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event: ")) eventName = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (data === "") continue;
+      if (eventName === "burst-end") {
+        try {
+          end = JSON.parse(data);
+        } catch {
+          end = null;
+        }
+        break outer;
+      }
+      try {
+        const f = new Uint8Array(Buffer.from(data, "base64"));
+        if (f.length > 0 && f[0] === 0xe1) updates.push(f);
+      } catch {}
+    }
+  }
+  await reader.cancel();
+  return { updates, end };
+}
+
+// --- Room C: burst-end marker + race-safe log compaction ---
+const roomC = `enc-c-${Date.now()}`;
+const keyC = await deriveKey("compact test passphrase!!", roomC);
+{
+  const verC = await encFrame(keyC, te.encode(`YPAD-ENC1:${roomC}`));
+  await fetch(`${BASE}/${roomC}?initEnc=1`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=UTF-8" },
+    body: verC,
+  });
+  const frames = [];
+  for (let i = 1; i <= 3; i++) {
+    frames.push(await encFrame(keyC, te.encode(`C-FRAME-${i}`)));
+  }
+  await fetch(`${BASE}/${roomC}?transport=http&token=tc`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=UTF-8" },
+    body: pack(frames),
+  });
+
+  const burst1 = await readSseBurst(roomC, { token: "tc1" });
+  check("burst-end marker present", burst1.end !== null && typeof burst1.end.v === "number", JSON.stringify(burst1.end));
+  check("burst-end reports log bytes", burst1.end !== null && burst1.end.bytes > 0, JSON.stringify(burst1.end));
+  check("burst-end arrives after full replay", burst1.updates.length === 3, `got ${burst1.updates.length}`);
+  const v1 = burst1.end?.v;
+
+  const snap = await encFrame(keyC, te.encode("COMPACTED-STATE"));
+  const stale = await fetch(`${BASE}/${roomC}?snapshot=1&baseVersion=${v1 + 1000}`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=UTF-8" },
+    body: snap,
+  });
+  check("stale-version compaction -> 409", stale.status === 409 && (await stale.json()).error === "version-mismatch", String(stale.status));
+  const burst2 = await readSseBurst(roomC, { token: "tc2" });
+  check("log unchanged after rejected compaction", burst2.updates.length === 3 && burst2.end?.v === v1, `updates=${burst2.updates.length} v=${burst2.end?.v}`);
+
+  const ok = await fetch(`${BASE}/${roomC}?snapshot=1&baseVersion=${v1}`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=UTF-8" },
+    body: snap,
+  });
+  check("current-version compaction -> 200", ok.status === 200, String(ok.status));
+  const burst3 = await readSseBurst(roomC, { token: "tc3" });
+  check("compacted log replays 1 frame", burst3.updates.length === 1, `got ${burst3.updates.length}`);
+  if (burst3.updates.length === 1) {
+    const back = await decFrame(keyC, burst3.updates[0]);
+    check("compacted frame decrypts", new TextDecoder().decode(back) === "COMPACTED-STATE");
+  }
+  check("burst-end version advanced", burst3.end !== null && burst3.end.v === v1 + 1, JSON.stringify(burst3.end));
+  check("burst-end bytes match snapshot", burst3.end !== null && burst3.end.bytes === snap.length, JSON.stringify(burst3.end));
+
+  await fetch(`${BASE}/${roomC}?transport=http&token=tc`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=UTF-8" },
+    body: pack([await encFrame(keyC, te.encode("C-FRAME-4"))]),
+  });
+  const burst4 = await readSseBurst(roomC, { token: "tc4" });
+  check("post-compaction appends preserved", burst4.updates.length === 2, `got ${burst4.updates.length}`);
+}
+
+// Snapshot against a plaintext room must be rejected
+{
+  const roomE = `enc-e-${Date.now()}`;
+  const res = await fetch(`${BASE}/${roomE}?snapshot=1&baseVersion=0`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=UTF-8" },
+    body: new Uint8Array([0xe1, 0, 1, 2]),
+  });
+  check("snapshot on plain room -> 409", res.status === 409 && (await res.json()).error === "not-encrypted", String(res.status));
+}
+
+// --- Room D: full cap evicts oldest frames instead of bricking the relay ---
+{
+  const roomD = `enc-d-${Date.now()}`;
+  const keyD = await deriveKey("eviction test passphrase!!", roomD);
+  const verD = await encFrame(keyD, te.encode(`YPAD-ENC1:${roomD}`));
+  await fetch(`${BASE}/${roomD}?initEnc=1`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=UTF-8" },
+    body: verD,
+  });
+
+  const pt = (tag, ch) => te.encode(`${tag}:`.padEnd(50000, ch));
+  const frameLen = 1 + 12 + 50000 + 16; // version + IV + ciphertext(+GCM tag)
+  const cap = 2 * 1024 * 1024;
+  const maxFrames = Math.floor(cap / frameLen);
+  const first = await encFrame(keyD, pt("FIRST", "A"));
+  const fills = [];
+  for (let i = 0; i < maxFrames + 1; i++) {
+    fills.push(await encFrame(keyD, pt(`FILL-${i}`, "B")));
+  }
+  const last = await encFrame(keyD, pt("LAST", "C"));
+  const all = [first, ...fills, last]; // maxFrames + 3 appends -> 3 evictions
+  check("eviction test frame math", maxFrames === 41 && all.length === maxFrames + 3, `maxFrames=${maxFrames}`);
+
+  const res = await fetch(`${BASE}/${roomD}?transport=http&token=td`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=UTF-8" },
+    body: pack(all),
+  });
+  check("bulk enc POST at cap 200", res.status === 200);
+
+  const burst = await readSseBurst(roomD, { token: "td1", ms: 30000 });
+  check("relay alive at cap, log bounded", burst.updates.length === maxFrames, `got ${burst.updates.length}, expected ${maxFrames}`);
+  check(
+    "burst-end bytes within cap",
+    burst.end !== null && burst.end.bytes <= cap && burst.end.bytes > cap - 2 * frameLen,
+    JSON.stringify(burst.end),
+  );
+  if (burst.updates.length === maxFrames) {
+    const firstPlain = new TextDecoder().decode(await decFrame(keyD, burst.updates[0]));
+    const lastPlain = new TextDecoder().decode(await decFrame(keyD, burst.updates[burst.updates.length - 1]));
+    check("oldest frames evicted", firstPlain.startsWith("FILL-2:"), firstPlain.slice(0, 10));
+    check("newest frame kept", lastPlain.startsWith("LAST:"), lastPlain.slice(0, 10));
+  }
+}
+
 process.exit(failures === 0 ? 0 : 1);

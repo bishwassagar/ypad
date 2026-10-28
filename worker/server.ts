@@ -27,8 +27,11 @@ const STATE_KEY = "state";
 const MODE_KEY = "mode";
 const ENC_LOG_KEY = "enc-log";
 const ENC_VERIFIER_KEY = "enc-verifier";
+const ENC_LOG_VERSION_KEY = "enc-log-version";
 // Cap for the opaque ciphertext log per encrypted room. Keeps free-tier
-// storage bounded; clients compact by uploading a snapshot that supersedes it.
+// storage bounded; when hit, the oldest frames are evicted. Clients keep the
+// log small in practice by compacting (?snapshot=1) — a CAS-guarded replace
+// that swaps the whole log for one full-state envelope.
 const ENC_LOG_CAP_BYTES = 2 * 1024 * 1024;
 const PERSIST_DEBOUNCE_MS = 500;
 // Browser-facing SSE keepalive. Runs inside the plain front Worker, which has
@@ -152,7 +155,15 @@ async function relaySse(
 
   ws.addEventListener("message", (e) => {
     if (!open) return;
-    if (typeof e.data === "string") return; // "pong" from the auto-response leg
+    if (typeof e.data === "string") {
+      // "pong" from the auto-response leg is ignored; the DO's end-of-replay
+      // marker rides a string message and becomes a named SSE event so
+      // clients learn when the ciphertext burst is fully applied.
+      if (e.data.startsWith("burst-end:")) {
+        void write(`event: burst-end\ndata: ${e.data.slice("burst-end:".length)}\n\n`);
+      }
+      return;
+    }
     const bytes = new Uint8Array(e.data);
     const t = bytes.length > 0 ? bytes[0] : 0;
     if (
@@ -226,6 +237,10 @@ export class YpadRoom extends DurableObject<Env> {
   private encLog: Uint8Array[] = [];
   private encLogBytes = 0;
   private encVerifier: Uint8Array | null = null;
+  // Bumped whenever log content changes (append, eviction, compaction). Lets
+  // clients compact race-free: a snapshot is accepted only if it was encoded
+  // against the version still current on the server.
+  private logVersion = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -235,6 +250,10 @@ export class YpadRoom extends DurableObject<Env> {
   }
 
   private initDoc(): void {
+    // Destroy the old awareness before replacing it: it owns a 15s renewal
+    // interval and listeners that would otherwise keep firing against the
+    // fresh instance (whose meta map lacks the old clientID) and throw.
+    this.awareness?.destroy();
     this.doc = new Y.Doc();
     this.awareness = new awarenessProtocol.Awareness(this.doc);
     this.doc.on("update", (update) => {
@@ -328,9 +347,15 @@ export class YpadRoom extends DurableObject<Env> {
     // peer that hasn't reloaded since a password takeover — drop it rather
     // than polluting the ciphertext log.
     if (frame[0] !== 0xe1) return false;
-    if (this.encLogBytes + frame.length > ENC_LOG_CAP_BYTES) return false;
+    // Evict oldest frames to make room instead of refusing: a full log must
+    // never take the live relay down, it only bounds late-joiner history.
+    while (this.encLogBytes + frame.length > ENC_LOG_CAP_BYTES && this.encLog.length > 0) {
+      const dropped = this.encLog.shift();
+      if (dropped) this.encLogBytes -= dropped.length;
+    }
     this.encLog.push(frame.slice());
     this.encLogBytes += frame.length;
+    this.logVersion++;
     return true;
   }
 
@@ -365,6 +390,10 @@ export class YpadRoom extends DurableObject<Env> {
       });
     }
     if (request.method === "POST") {
+      // Drain the body before any branch can answer early: responding to a
+      // POST with its request stream unread makes the runtime throw an
+      // uncaught post-response error, and enough of them tear it down.
+      const body = new Uint8Array(await request.arrayBuffer());
       const token = reqUrl.searchParams.get("token");
       // Claim an empty (or taken-over) room as password-encrypted. The body is
       // the AES-GCM verifier envelope; the password never leaves the browser.
@@ -385,7 +414,7 @@ export class YpadRoom extends DurableObject<Env> {
             headers: { "Content-Type": "application/json", ...cors },
           });
         }
-        const verifier = new Uint8Array(await request.arrayBuffer());
+        const verifier = body;
         if (verifier.length === 0) {
           return new Response("missing verifier", { status: 400 });
         }
@@ -393,10 +422,12 @@ export class YpadRoom extends DurableObject<Env> {
         this.encVerifier = verifier.slice();
         this.encLog = [];
         this.encLogBytes = 0;
+        this.logVersion = 0;
         this.initDoc();
         await this.ctx.storage.put(MODE_KEY, "enc");
         await this.ctx.storage.put(ENC_VERIFIER_KEY, this.encVerifier);
         await this.ctx.storage.put(ENC_LOG_KEY, new Uint8Array(0));
+        await this.ctx.storage.put(ENC_LOG_VERSION_KEY, 0);
         await this.ctx.storage.deleteAlarm();
         this.deleted = false;
         return new Response(JSON.stringify({ ok: true }), {
@@ -410,7 +441,43 @@ export class YpadRoom extends DurableObject<Env> {
         if (target) target.close(1000, "client goodbye");
         return new Response(null, { headers: cors });
       }
-      const body = new Uint8Array(await request.arrayBuffer());
+      // Compaction: replace the whole ciphertext log with one full-state
+      // envelope. Guarded by the log version so a snapshot encoded before a
+      // concurrent append can never erase that append — the client received
+      // newer frames live anyway and simply skips compacting on mismatch.
+      if (reqUrl.searchParams.get("snapshot") === "1") {
+        if (this.mode !== "enc") {
+          return new Response(JSON.stringify({ error: "not-encrypted" }), {
+            status: 409,
+            headers: { "Content-Type": "application/json", ...cors },
+          });
+        }
+        const base = Number(reqUrl.searchParams.get("baseVersion") ?? "-1");
+        const frame = body;
+        if (
+          frame.length === 0 ||
+          frame.length > ENC_LOG_CAP_BYTES ||
+          frame[0] !== 0xe1
+        ) {
+          return new Response(JSON.stringify({ error: "bad-snapshot" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json", ...cors },
+          });
+        }
+        if (base !== this.logVersion) {
+          return new Response(JSON.stringify({ error: "version-mismatch" }), {
+            status: 409,
+            headers: { "Content-Type": "application/json", ...cors },
+          });
+        }
+        this.encLog = [frame.slice()];
+        this.encLogBytes = frame.length;
+        this.logVersion++;
+        await this.persist();
+        return new Response(JSON.stringify({ ok: true, bytes: frame.length }), {
+          headers: { "Content-Type": "application/json", ...cors },
+        });
+      }
       if (this.mode === "enc") {
         // Opaque relay: store + broadcast, reply empty. History reaches late
         // joiners through the SSE burst / WS initial state, not POST replies.
@@ -448,6 +515,12 @@ export class YpadRoom extends DurableObject<Env> {
         for (const frame of this.encLog) {
           client.send(frame);
         }
+        // End-of-replay marker. The SSE relay forwards it as a named event;
+        // clients use it to know their doc now covers the log (safe to
+        // compact) and learn the current version + size.
+        client.send(
+          `burst-end:${JSON.stringify({ v: this.logVersion, bytes: this.encLogBytes })}`
+        );
         return;
       }
       const encoder = encoding.createEncoder();
@@ -599,6 +672,7 @@ export class YpadRoom extends DurableObject<Env> {
     this.encLog = [];
     this.encLogBytes = 0;
     this.encVerifier = null;
+    this.logVersion = 0;
     this.initDoc();
     this.loaded = true;
   }
@@ -630,6 +704,8 @@ export class YpadRoom extends DurableObject<Env> {
       const packed = await this.ctx.storage.get<Uint8Array>(ENC_LOG_KEY);
       this.encLog = packed ? this.splitEncPacked(packed) : [];
       this.encLogBytes = this.encLog.reduce((n, f) => n + f.length, 0);
+      this.logVersion =
+        (await this.ctx.storage.get<number>(ENC_LOG_VERSION_KEY)) ?? 0;
       this.initDoc();
       return;
     }
@@ -653,6 +729,7 @@ export class YpadRoom extends DurableObject<Env> {
         await this.ctx.storage.put(ENC_VERIFIER_KEY, this.encVerifier);
       }
       await this.ctx.storage.put(ENC_LOG_KEY, this.packEncLog());
+      await this.ctx.storage.put(ENC_LOG_VERSION_KEY, this.logVersion);
       return;
     }
     await this.ctx.storage.put(STATE_KEY, Y.encodeStateAsUpdate(this.doc));

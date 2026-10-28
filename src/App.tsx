@@ -95,18 +95,33 @@ interface RoomStatus {
   verifier?: string;
 }
 
+// Fail closed: if the status cannot be verified, the caller must not open a
+// plaintext session on what may be an encrypted pad. Retries ride out brief
+// 5xx windows before the error gate shows.
 async function fetchRoomStatus(roomId: string): Promise<RoomStatus> {
-  const res = await fetch(
-    `${httpSyncServerUrl()}/${encodeURIComponent(roomId)}?status=1`,
-  );
-  if (!res.ok) return { mode: "plain", hasData: false };
-  const body = (await res.json()) as RoomStatus;
-  return body.mode === "enc"
-    ? { mode: "enc", hasData: body.hasData, verifier: body.verifier }
-    : { mode: "plain", hasData: body.hasData };
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+    }
+    try {
+      const res = await fetch(
+        `${httpSyncServerUrl()}/${encodeURIComponent(roomId)}?status=1`,
+      );
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const body = (await res.json()) as RoomStatus;
+      if (body.mode === "enc") {
+        return { mode: "enc", hasData: body.hasData, verifier: body.verifier };
+      }
+      return { mode: "plain", hasData: body.hasData };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error("status unreachable");
 }
 
-type LockKind = "checking" | "setup" | "plain" | "locked" | "unlocked";
+type LockKind = "checking" | "setup" | "plain" | "locked" | "unlocked" | "error";
 
 function PasswordModal({
   title,
@@ -243,6 +258,8 @@ export default function App() {
   const [pwError, setPwError] = useState<string | null>(null);
   const [pwBusy, setPwBusy] = useState(false);
   const [showAddPw, setShowAddPw] = useState(false);
+  const [checkAttempt, setCheckAttempt] = useState(0);
+  const [lockError, setLockError] = useState<string | null>(null);
   const encKeyRef = useRef<CryptoKey | null>(null);
   encKeyRef.current = encKey;
 
@@ -257,11 +274,19 @@ export default function App() {
     setEncKey(null);
     setPwError(null);
     setShowAddPw(false);
+    setLockError(null);
     void fetchRoomStatus(roomId)
       .then(async (st) => {
         if (cancelled) return;
         setStatus2(st);
-        if (st.mode === "enc" && st.verifier) {
+        if (st.mode === "enc") {
+          if (!st.verifier) {
+            setLockError(
+              "This pad is encrypted, but its lock data is incomplete on the server.",
+            );
+            setLock("error");
+            return;
+          }
           const cached = sessionStorage.getItem(sessionKeyName(roomId));
           if (cached) {
             try {
@@ -285,15 +310,12 @@ export default function App() {
         }
       })
       .catch(() => {
-        if (!cancelled) {
-          setStatus2({ mode: "plain", hasData: false });
-          setLock("plain");
-        }
+        if (!cancelled) setLock("error");
       });
     return () => {
       cancelled = true;
     };
-  }, [roomId]);
+  }, [roomId, checkAttempt]);
 
   async function cacheKey(key: CryptoKey) {
     try {
@@ -338,6 +360,8 @@ export default function App() {
       setStatus2({ mode: "enc", hasData: false });
       setLock("unlocked");
       setShowAddPw(false);
+    } catch {
+      setPwError("Couldn't reach the server. Try again.");
     } finally {
       setPwBusy(false);
     }
@@ -562,7 +586,6 @@ export default function App() {
 
   useEffect(() => {
     if (lock !== "unlocked" || !encKey) return;
-    let cancelled = false;
     const p = new EncHttpSyncProvider(httpSyncServerUrl(), roomId, doc, encKey, {
       awareness,
     });
@@ -577,14 +600,7 @@ export default function App() {
     };
     p.on("status", onStatus);
     p.connect();
-    // If this client already holds content (password takeover on a plaintext
-    // room), upload it as ciphertext so history survives the mode switch.
-    const t = window.setTimeout(() => {
-      if (!cancelled) p.pushSnapshot();
-    }, 1500);
     return () => {
-      cancelled = true;
-      clearTimeout(t);
       p.off("status", onStatus);
       p.disconnect();
       p.destroy();
@@ -848,6 +864,28 @@ export default function App() {
           <p className="text-sm text-neutral-500 dark:text-neutral-400">
             Checking pad…
           </p>
+        </div>
+      )}
+
+      {lock === "error" && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-white p-4 dark:bg-neutral-950">
+          <div className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-5 shadow-xl dark:border-neutral-800 dark:bg-neutral-900">
+            <div className="mb-1 flex items-center gap-2 text-sm font-medium text-neutral-900 dark:text-neutral-100">
+              <Lock size={16} />
+              Couldn&apos;t verify this pad
+            </div>
+            <p className="mb-4 text-xs text-neutral-500 dark:text-neutral-400">
+              {lockError ??
+                "The sync server couldn't be reached. The pad stays locked rather than risk opening an encrypted pad as plaintext — your content is safe on the server."}
+            </p>
+            <button
+              type="button"
+              onClick={() => setCheckAttempt((n) => n + 1)}
+              className="w-full rounded-md bg-neutral-900 px-3 py-2 text-xs font-medium text-white hover:bg-neutral-700 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white"
+            >
+              Retry
+            </button>
+          </div>
         </div>
       )}
 
